@@ -125,8 +125,8 @@ Hosts the heavy MoE model on demand via `--mmap`.
 
 - Model: `unsloth/Qwen3.5-35B-A3B-GGUF` at `UD-IQ3_XXS` quantization (~13 GB on disk).
 - MoE architecture: 35B total params, 3B active per token. With `--mmap` the OS pages experts from the NVMe on demand; only shared layers (~5 GB) stay resident.
-- Expected throughput: ~17 tok/s at 16K context on base M4 Mac Mini (per leopardracer's published measurements).
-- Flags: `--n-gpu-layers 0 --mmap --flash-attn on --ctx-size 16384 --threads 8`.
+- Observed throughput: ~8 tok/s cold, trending up with use as the macOS page cache warms around the expert-weight working set. Leopardracer's 17 tok/s was after days of continuous operation. Acceptable for heavy-tier use cases (overnight batch, episodic fallback).
+- Flags: `-ngl 0 --ctx-size 16384 --reasoning off --threads 10`. (Metal init happens even at `-ngl 0`; mmap is default; `--flash-attn` defaults to auto; `--reasoning off` globally disables Qwen 3.5 thinking mode — critical for speed.)
 - Use cases: nightly Pluto-activity compression, Claude fallback when rate-limited, weekly vault consolidation passes.
 
 Run on-demand via a LaunchAgent the ingester can `launchctl kickstart` when needed; unload after idle.

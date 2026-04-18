@@ -69,3 +69,20 @@ The system never passes raw vault content to Claude unless the caller explicitly
 - No Claude tokens spent on scoring, summarizing, or traversal
 
 This is the whole point. Gemma is the librarian; Claude is the expert; the user's Claude Max budget stays focused on actual thinking.
+
+
+## Qwen 3.5 thinking mode — server-level disable
+
+Qwen 3.5 35B-A3B has "thinking" (reasoning) mode baked into its chat template. Without it off, the model burns every output token on internal chain-of-thought before producing anything visible, tanking throughput and making `content` empty. llama.cpp's server exposes two ways to disable it; we use the CLI flag for consistency across all callers:
+
+- **Global (how we do it):** launch llama-server with `--reasoning off`. Applies to every request regardless of client.
+- **Per-request:** pass `{"chat_template_kwargs": {"enable_thinking": false}}` in the API body. Required when calling a server that doesn't have `--reasoning off` baked in.
+
+The LaunchAgent at `mac-mini/launchd/com.gobag.llamacpp.plist` already bakes in `--reasoning off`. Any request against port 8081 will get a non-thinking response.
+
+## Observed throughput on base M4 Mac Mini 16GB
+
+- Cold: ~8 tok/s with all 10 threads, reasoning off, 4K context, `-ngl 0`.
+- The bottleneck is **SSD read bandwidth** paging expert weights for each token, not CPU compute (so `--threads 10` vs `--threads 4` makes little difference).
+- Expected to trend upward over days/weeks of use as macOS page cache learns the working set of frequently-activated experts.
+- Acceptable for heavy-tier use cases (overnight batch compression, rare Claude fallback). Not suitable as an interactive model.

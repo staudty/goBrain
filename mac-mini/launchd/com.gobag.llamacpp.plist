@@ -14,13 +14,12 @@
         <string>8081</string>
         <string>--ctx-size</string>
         <string>16384</string>
-        <string>--n-gpu-layers</string>
+        <string>-ngl</string>
         <string>0</string>
-        <string>--mmap</string>
-        <string>--flash-attn</string>
-        <string>on</string>
+        <string>--reasoning</string>
+        <string>off</string>
         <string>--threads</string>
-        <string>8</string>
+        <string>10</string>
         <string>--host</string>
         <string>127.0.0.1</string>
     </array>
