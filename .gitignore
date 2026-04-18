@@ -1,0 +1,43 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# uv
+uv.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data paths (never commit)
+compose/postgres/data/
+compose/postgres/pgadmin/
+*.sqlite
+*.sqlite-journal
+*.dump
+
+# Logs
+*.log
+
+# Local IDE
+.vscode/
+.idea/
+
+# macOS launchd rendered plists (copies live in ~/Library/LaunchAgents)
+# The source templates in mac-mini/launchd/ ARE committed.

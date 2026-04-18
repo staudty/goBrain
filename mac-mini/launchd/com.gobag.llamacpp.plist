@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gobag.llamacpp</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/llama-server</string>
+        <string>--model</string>
+        <string>__MODEL_PATH__</string>
+        <string>--port</string>
+        <string>8081</string>
+        <string>--ctx-size</string>
+        <string>16384</string>
+        <string>--n-gpu-layers</string>
+        <string>0</string>
+        <string>--mmap</string>
+        <string>--flash-attn</string>
+        <string>on</string>
+        <string>--threads</string>
+        <string>8</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- NOT run at load; started on demand by the ingester. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Don't auto-restart; heavy tier is episodic. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/gobag-llamacpp.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/gobag-llamacpp.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

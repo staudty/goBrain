@@ -1,0 +1,53 @@
+"""Runtime configuration loaded from env + .env."""
+from __future__ import annotations
+
+from pathlib import Path
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="BRAIN_",
+        extra="ignore",
+    )
+
+    # --- HTTP -----------------------------------------------------------------
+    host: str = "127.0.0.1"
+    port: int = 8765
+
+    # --- Vault ---------------------------------------------------------------
+    vault_path: Path = Path.home() / "Brain"
+
+    # --- Storage: Postgres (primary) -----------------------------------------
+    # Before the NAS RAM upgrade lands, leave postgres_dsn empty and the
+    # ingester will buffer to sqlite at fallback_sqlite_path. Once Postgres is
+    # up, set this and the ingester drains the buffer.
+    postgres_dsn: str | None = None
+    fallback_sqlite_path: Path = Path.home() / ".goBrain" / "buffer.sqlite"
+
+    # --- Ollama --------------------------------------------------------------
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    model_fast: str = "gemma4:e2b"          # classification / routing
+    model_primary: str = "gemma4:e4b"       # summarization / re-ranking
+    model_embed: str = "nomic-embed-text"
+    embed_dim: int = 768
+
+    # --- llama.cpp (heavy tier) ----------------------------------------------
+    llamacpp_base_url: str = "http://127.0.0.1:8081"
+    llamacpp_launchd_label: str = "com.gobag.llamacpp"
+
+    # --- Watcher toggles -----------------------------------------------------
+    watch_claude_code: bool = True
+    claude_code_projects_dir: Path = Path.home() / ".claude" / "projects"
+    watch_claude_desktop: bool = True
+    watch_inbox: bool = True
+    inbox_path: Path = Path.home() / "Brain" / "_inbox"
+
+    # --- Chunking ------------------------------------------------------------
+    chunk_target_tokens: int = 500
+    chunk_overlap_tokens: int = 100
+
+
+settings = Settings()
