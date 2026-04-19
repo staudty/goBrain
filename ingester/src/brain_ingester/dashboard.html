@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>goBrain — status</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+    .pulse-dot { animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <div class="max-w-6xl mx-auto px-6 py-8">
+    <header class="flex items-center justify-between mb-8">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-tight">goBrain</h1>
+        <p class="text-sm text-slate-400">ingester status · local dashboard</p>
+      </div>
+      <div class="flex items-center gap-3 text-sm">
+        <span id="health-dot" class="w-2.5 h-2.5 rounded-full bg-slate-500 pulse-dot"></span>
+        <span id="health-text" class="text-slate-300">connecting…</span>
+        <span class="text-slate-500">·</span>
+        <span id="last-refresh" class="text-slate-400 font-mono text-xs">—</span>
+      </div>
+    </header>
+
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <div class="text-xs uppercase tracking-wider text-slate-400">Total documents</div>
+        <div id="stat-total" class="text-3xl font-semibold mt-2">—</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <div class="text-xs uppercase tracking-wider text-slate-400">Last 24h</div>
+        <div id="stat-24h" class="text-3xl font-semibold mt-2">—</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <div class="text-xs uppercase tracking-wider text-slate-400">Docs / hour (24h avg)</div>
+        <div id="stat-rate" class="text-3xl font-semibold mt-2">—</div>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <div class="text-xs uppercase tracking-wider text-slate-400">SQLite buffer</div>
+        <div id="stat-buffer" class="text-3xl font-semibold mt-2">—</div>
+        <div class="text-xs text-slate-500 mt-1">pending replay to Postgres</div>
+      </div>
+    </section>
+
+    <section class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-8">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 lg:col-span-2">
+        <h2 class="text-sm uppercase tracking-wider text-slate-400 mb-4">Ingest velocity (last 24h)</h2>
+        <canvas id="velocity-chart" height="140"></canvas>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-sm uppercase tracking-wider text-slate-400 mb-4">By source</h2>
+        <div id="sources-list" class="space-y-2 text-sm">
+          <div class="text-slate-500">loading…</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm uppercase tracking-wider text-slate-400">Recent documents</h2>
+        <span id="recent-count" class="text-xs text-slate-500"></span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-left text-xs uppercase tracking-wider text-slate-400 border-b border-slate-800">
+              <th class="py-2 pr-4 font-medium">When</th>
+              <th class="py-2 pr-4 font-medium">Source</th>
+              <th class="py-2 pr-4 font-medium">Project</th>
+              <th class="py-2 pr-4 font-medium">Turns</th>
+              <th class="py-2 font-medium">Summary</th>
+            </tr>
+          </thead>
+          <tbody id="recent-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer class="mt-8 text-xs text-slate-500 flex justify-between">
+      <span>Polling every 5s. Primary endpoints: <code class="text-slate-400">/stats/counts</code>, <code class="text-slate-400">/stats/recent</code>, <code class="text-slate-400">/stats/timeline</code>.</span>
+      <span><a class="hover:text-slate-300" href="/health">/health</a></span>
+    </footer>
+  </div>
+
+  <script>
+    const SOURCE_COLORS = {
+      "claude-code": "#60a5fa",
+      "claude-desktop": "#a78bfa",
+      "claude-ai": "#f472b6",
+      "grok": "#34d399",
+      "inbox": "#fbbf24",
+    };
+    function sourceColor(src) { return SOURCE_COLORS[src] || "#94a3b8"; }
+
+    function relTime(iso) {
+      if (!iso) return "—";
+      const then = new Date(iso).getTime();
+      const diff = (Date.now() - then) / 1000;
+      if (diff < 60) return `${Math.floor(diff)}s ago`;
+      if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+      if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+      return `${Math.floor(diff / 86400)}d ago`;
+    }
+
+    function truncate(s, n) {
+      if (!s) return "";
+      return s.length > n ? s.slice(0, n - 1) + "…" : s;
+    }
+
+    function setHealth(ok, msg) {
+      const dot = document.getElementById("health-dot");
+      const txt = document.getElementById("health-text");
+      dot.className = "w-2.5 h-2.5 rounded-full pulse-dot " + (ok ? "bg-emerald-400" : "bg-rose-500");
+      txt.textContent = msg;
+    }
+
+    let chart;
+    function renderChart(buckets) {
+      const now = new Date();
+      const hours = [];
+      for (let i = 23; i >= 0; i--) {
+        const d = new Date(now.getTime() - i * 3600 * 1000);
+        d.setMinutes(0, 0, 0);
+        hours.push(d);
+      }
+      const map = new Map();
+      for (const b of buckets) map.set(new Date(b.bucket).toISOString(), b.count);
+      const data = hours.map((h) => map.get(h.toISOString()) ?? 0);
+      const labels = hours.map((h) => h.getHours().toString().padStart(2, "0"));
+
+      const ctx = document.getElementById("velocity-chart");
+      if (!chart) {
+        chart = new Chart(ctx, {
+          type: "bar",
+          data: { labels, datasets: [{ data, backgroundColor: "#60a5fa", borderRadius: 4 }] },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+              x: { ticks: { color: "#94a3b8" }, grid: { display: false } },
+              y: { ticks: { color: "#94a3b8", precision: 0 }, grid: { color: "#1e293b" }, beginAtZero: true },
+            },
+          },
+        });
+      } else {
+        chart.data.labels = labels;
+        chart.data.datasets[0].data = data;
+        chart.update("none");
+      }
+    }
+
+    function renderSources(bySource, total) {
+      const el = document.getElementById("sources-list");
+      if (!bySource.length) {
+        el.innerHTML = `<div class="text-slate-500">no documents yet</div>`;
+        return;
+      }
+      el.innerHTML = bySource.map((s) => {
+        const pct = total ? Math.round((s.count / total) * 100) : 0;
+        const color = sourceColor(s.source);
+        return `
+          <div>
+            <div class="flex justify-between mb-1">
+              <span class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full" style="background:${color}"></span>
+                <span>${s.source}</span>
+              </span>
+              <span class="text-slate-400 font-mono">${s.count}</span>
+            </div>
+            <div class="w-full bg-slate-800 rounded-full h-1.5">
+              <div class="h-1.5 rounded-full" style="width:${pct}%;background:${color}"></div>
+            </div>
+          </div>`;
+      }).join("");
+    }
+
+    function renderRecent(items) {
+      const tbody = document.getElementById("recent-rows");
+      document.getElementById("recent-count").textContent = `${items.length} shown`;
+      if (!items.length) {
+        tbody.innerHTML = `<tr><td colspan="5" class="py-6 text-center text-slate-500">no documents yet</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = items.map((it) => `
+        <tr class="border-b border-slate-800/60 last:border-0">
+          <td class="py-2 pr-4 text-slate-400 whitespace-nowrap">${relTime(it.ingested_at)}</td>
+          <td class="py-2 pr-4">
+            <span class="inline-flex items-center gap-1.5">
+              <span class="w-1.5 h-1.5 rounded-full" style="background:${sourceColor(it.source)}"></span>
+              <span class="text-slate-300">${it.source}</span>
+            </span>
+          </td>
+          <td class="py-2 pr-4 text-slate-400 font-mono text-xs">${truncate(it.project || "—", 28)}</td>
+          <td class="py-2 pr-4 text-slate-400 font-mono">${it.turn_count ?? "—"}</td>
+          <td class="py-2 text-slate-300">${truncate(it.summary || "", 120)}</td>
+        </tr>
+      `).join("");
+    }
+
+    async function refresh() {
+      try {
+        const [countsRes, recentRes, timelineRes] = await Promise.all([
+          fetch("/stats/counts"),
+          fetch("/stats/recent?limit=25"),
+          fetch("/stats/timeline?hours=24"),
+        ]);
+        if (!countsRes.ok || !recentRes.ok || !timelineRes.ok) throw new Error("non-200");
+        const counts = await countsRes.json();
+        const recent = await recentRes.json();
+        const timeline = await timelineRes.json();
+
+        if (!counts.postgres_configured) {
+          setHealth(false, "Postgres not configured — ingester is buffering to SQLite");
+        } else {
+          setHealth(true, "online");
+        }
+
+        document.getElementById("stat-total").textContent = (counts.total ?? 0).toLocaleString();
+        document.getElementById("stat-24h").textContent = (counts.last_24h ?? 0).toLocaleString();
+        document.getElementById("stat-rate").textContent = counts.last_24h != null
+          ? (counts.last_24h / 24).toFixed(1)
+          : "—";
+        document.getElementById("stat-buffer").textContent = (counts.buffer ?? 0).toLocaleString();
+
+        renderSources(counts.by_source || [], counts.total || 0);
+        renderChart(timeline.buckets || []);
+        renderRecent(recent.items || []);
+
+        document.getElementById("last-refresh").textContent = new Date().toLocaleTimeString();
+      } catch (err) {
+        setHealth(false, "ingester unreachable");
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

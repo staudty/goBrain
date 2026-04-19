@@ -30,6 +30,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/brain_ingester"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"src/brain_ingester/dashboard.html" = "brain_ingester/dashboard.html"
+
 [tool.uv]
 dev-dependencies = [
     "pytest>=8",

@@ -1,7 +1,11 @@
 """FastAPI entry point for the ingester.
 
 Endpoints:
-  POST /ingest/document                 — generic, for remote shippers (e.g. Windows PC Claude Code)
+  GET  /dashboard                       — zero-build status dashboard (HTML)
+  GET  /stats/counts                    — totals per source + grand total + buffer
+  GET  /stats/recent                    — recent documents for the recency table
+  GET  /stats/timeline                  — hourly ingest counts for the last 24h
+  POST /ingest/document                 — generic, for remote shippers
   POST /admin/drain-buffer              — replay SQLite buffer into Postgres
   POST /admin/reingest/claude-code      — backfill every Claude Code JSONL we can see
   POST /admin/reingest/inbox            — re-process everything currently in _inbox/
@@ -13,20 +17,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from sqlalchemy import func, select, text
 
 from .config import settings
-from .db import buffer_size, drain_buffer, postgres_available
+from .db import buffer_size, drain_buffer, pg_session, postgres_available
+from .models import Document
 from .ollama_client import OllamaClient
 from .watchers import claude_code as claude_code_watcher
 from .watchers import inbox as inbox_watcher
 from .writers import IngestInput, ingest_document
+
+_DASHBOARD_HTML = Path(__file__).parent / "dashboard.html"
 
 
 def _configure_logging() -> None:
@@ -104,6 +114,102 @@ def create_app() -> FastAPI:
             "postgres_configured": postgres_available(),
             "buffer": {"documents": docs},
             "vault": str(settings.vault_path),
+        }
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def dashboard() -> HTMLResponse:
+        if not _DASHBOARD_HTML.exists():
+            raise HTTPException(status_code=500, detail="dashboard.html missing from package")
+        return HTMLResponse(_DASHBOARD_HTML.read_text(encoding="utf-8"))
+
+    @app.get("/stats/counts")
+    async def stats_counts() -> dict:
+        buf = buffer_size()
+        if not postgres_available():
+            return {
+                "postgres_configured": False,
+                "total": 0,
+                "by_source": [],
+                "buffer": buf,
+            }
+        with pg_session() as s:
+            rows = s.execute(
+                select(Document.source, func.count(Document.id))
+                .group_by(Document.source)
+                .order_by(func.count(Document.id).desc())
+            ).all()
+            total = s.execute(select(func.count(Document.id))).scalar_one()
+            since = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+            last_24h = s.execute(
+                select(func.count(Document.id)).where(Document.ingested_at >= since)
+            ).scalar_one()
+        return {
+            "postgres_configured": True,
+            "total": total,
+            "last_24h": last_24h,
+            "by_source": [{"source": src, "count": n} for src, n in rows],
+            "buffer": buf,
+        }
+
+    @app.get("/stats/recent")
+    async def stats_recent(limit: int = 25) -> dict:
+        if not postgres_available():
+            return {"postgres_configured": False, "items": []}
+        limit = max(1, min(limit, 100))
+        with pg_session() as s:
+            rows = s.execute(
+                select(
+                    Document.source,
+                    Document.project,
+                    Document.vault_path,
+                    Document.summary,
+                    Document.ingested_at,
+                    Document.turn_count,
+                )
+                .order_by(Document.ingested_at.desc())
+                .limit(limit)
+            ).all()
+        return {
+            "postgres_configured": True,
+            "items": [
+                {
+                    "source": r.source,
+                    "project": r.project,
+                    "vault_path": r.vault_path,
+                    "summary": r.summary,
+                    "ingested_at": r.ingested_at.isoformat() if r.ingested_at else None,
+                    "turn_count": r.turn_count,
+                }
+                for r in rows
+            ],
+        }
+
+    @app.get("/stats/timeline")
+    async def stats_timeline(hours: int = 24) -> dict:
+        """Hourly ingest counts over the last N hours (default 24, max 168)."""
+        if not postgres_available():
+            return {"postgres_configured": False, "buckets": []}
+        hours = max(1, min(hours, 168))
+        since = datetime.now(tz=timezone.utc) - timedelta(hours=hours)
+        with pg_session() as s:
+            rows = s.execute(
+                text(
+                    """
+                    SELECT date_trunc('hour', ingested_at) AS bucket, count(*) AS n
+                    FROM documents
+                    WHERE ingested_at >= :since
+                    GROUP BY bucket
+                    ORDER BY bucket ASC
+                    """
+                ),
+                {"since": since},
+            ).all()
+        return {
+            "postgres_configured": True,
+            "buckets": [
+                {"bucket": r.bucket.isoformat() if r.bucket else None, "count": r.n}
+                for r in rows
+            ],
         }
 
     @app.post("/ingest/document")
