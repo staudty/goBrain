@@ -1,179 +1,216 @@
 # goBrain
 
-A self-hosted **unified second brain** that captures every AI conversation and every meaningful action across Chris's stack, indexes it, and exposes it as a single searchable context surface to Claude Code, Claude Desktop, Pluto (Telegram bot on OpenClaw), Grok, and any other tool that speaks the Model Context Protocol (MCP).
+A self-hosted, local-first **unified second brain** that captures AI conversations and agent activity from every tool you use, indexes them with vector embeddings, and exposes a single `search_brain` tool to any client that speaks the Model Context Protocol (MCP).
 
-## Why
+Today, conversations you have with Claude (web, desktop, mobile, CLI), Grok, Claude Code terminal sessions, and any autonomous Claude Code agents you run are **siloed** — none of them can reference what happened in the others. goBrain unifies them into one markdown vault + one pgvector index, queryable from wherever you work.
 
-AI conversations are siloed across Claude Code sessions, Claude Desktop, Claude.ai web, Pluto on Telegram, and Grok on iPhone. None of them share memory with each other. goBrain unifies them into one vault + one vector index, queryable by all of them through a single `search_brain` MCP tool.
+<p align="center">
+  <img alt="goBrain high-level architecture" src="docs/architecture-dark.svg" width="720">
+</p>
 
-## The stack
+---
 
-```
-┌──────────────────────────┐      ┌────────────────────────────┐
-│ Windows PC               │      │ Mac Mini (M4, 16 GB)       │
-│ ──────────────           │      │ ────────────────           │
-│ Claude Code CLI          │      │ Claude Code CLI            │
-│ Claude Desktop           │      │ Claude Desktop             │
-│ Obsidian                 │      │ Obsidian                   │
-│ MCP brain (stdio)        │      │ MCP brain (stdio)          │
-│                          │      │                            │
-│ Scheduled task ──────────┼─Drive┤ Ingester (FastAPI :8765)   │
-│ ships Claude Code JSONLs │ sync │   ├─ Claude Code watcher   │
-│ to Brain/.claude-code-   │      │   ├─ _inbox/ watcher       │
-│ sources/pc/              │      │   └─ reingest API          │
-└──────────────────────────┘      │                            │
-                                  │ Ollama :11434 (LAN 0.0.0.0)│
-                                  │   gemma4:e2b  (rerank)     │
-                                  │   gemma4:e4b  (summarize)  │
-                                  │   nomic-embed (embeddings) │
-                                  │                            │
-                                  │ llama.cpp :8081 (on-demand)│
-                                  │   qwen3.5-35b-a3b MoE      │
-                                  └──────────┬─────────────────┘
-                                             │ network
-                                             ▼
-┌────────────────────────────────────────────────────────────────┐
-│ Synology DS224+ NAS (192.168.1.178)                            │
-│ ────────────────────                                           │
-│ /volume1/homes/cstaudt/Brain/        ← vault (markdown)        │
-│   ├─ sessions/                        (claude-code, claude-ai, │
-│   │                                    grok, inbox, pluto)     │
-│   ├─ _inbox/                          (manual exports dropped) │
-│   └─ .claude-code-sources/pc/         (Windows-shipped JSONLs) │
-│                                                                │
-│ /volume1/docker/brain-db/             ← Docker compose:        │
-│   Postgres 16 + pgvector (port 5433)  documents + chunks +     │
-│                                       pluto_events +           │
-│                                       ingestion_log tables     │
-└────────────────────────────────────────────────────────────────┘
-```
+## Highlights
 
-## Data flow
+- **Local-first.** Your data stays on hardware you own. The only model calls that leave your network are the ones you explicitly direct (e.g., asking Claude a question while it has your brain context loaded).
+- **Hybrid inference.** Small always-on local LLMs (via Ollama) do the librarian work — embeddings, summaries, rerank — while a large on-demand MoE model (via `llama.cpp`) is available for heavier offline work. Cloud LLMs are opt-in, never required.
+- **Everything is markdown.** The primary vault is plain markdown files, browsable in Obsidian. The vector index is an *additional* lens on top of the same content.
+- **Multiple AI sources, one query.** `search_brain("...")` runs against your full conversational history regardless of which tool or device produced it.
+- **Graceful degradation.** When the local GPU is busy with ingestion, search falls back to raw vector retrieval so you still get fast answers.
 
-**Ingestion (anything → brain):**
-- **Claude Code Mac** — `~/.claude/projects/*.jsonl` → live file watcher on Mac ingester → Gemma E4B summarizes → nomic-embed chunks → Postgres + markdown in `sessions/claude-code/`
-- **Claude Code Windows** — scheduled PowerShell task (every 10 min, silent via VBS wrapper) copies finished JSONLs (idle ≥5 min) to `Brain/.claude-code-sources/pc/` → Drive Client syncs → Mac's second Claude Code watcher picks them up
-- **Claude.ai / Grok exports** — user requests data export from the vendor, drops the ZIP into `Brain/_inbox/` → inbox watcher detects format via ZIP contents (`conversations.json` = Claude.ai, `prod-grok-backend.json` = Grok) → parser yields individual conversations → same Gemma pipeline
-- **Ad-hoc documents** — drop any `.md`, `.txt`, or raw backend `.json` into `_inbox/` — same pipeline
+---
 
-**Retrieval (any client → brain):**
-- Claude Code (Mac or Windows) invokes `search_brain(query, limit, sources)` via its local MCP server
-- MCP server embeds the query with nomic-embed, pulls top-K from pgvector, re-ranks with Gemma E2B, returns chunks
-- If Ollama is busy with ingestion (another model pinned), rerank is skipped gracefully — raw ANN top-K returned in seconds instead of hanging on model-swap thrashing
-
-## Hardware + software
-
-| Role | Host | Key software |
-|---|---|---|
-| Postgres + pgvector | Synology DS224+ NAS | Container Manager (Docker + Compose) |
-| Ingester, Ollama, llama.cpp, MCP brain | Mac Mini M4 16 GB | Homebrew (ollama, llama.cpp, uv), LaunchAgents |
-| Claude Code shipper, Obsidian, MCP brain | Windows PC (RTX 5090) | PowerShell Scheduled Task + VBS launcher, uv, Claude Code CLI |
-| Vault sync | all 3 machines | Synology Drive Client (two-way, on-demand disabled) |
-
-## Repo layout
+## Architecture
 
 ```
-goBrain/
-├── README.md                this file
-├── CLAUDE.md                live context for Claude Code sessions
-├── docs/
-│   ├── architecture.md      design rationale and data model
-│   ├── roadmap.md           day-by-day build plan and history
-│   ├── runbook.md           operational runbook for deploy and daily ops
-│   └── model-routing.md     which LLM does what and why
-├── compose/postgres/        Docker Compose for NAS
-│   ├── docker-compose.yml
-│   ├── init.sql             schema (documents, chunks, pluto_events, ingestion_log)
-│   └── .env.example
-├── mac-mini/                LaunchAgents + setup scripts for the Mac
-│   ├── setup-ollama.sh
-│   ├── setup-llamacpp.sh
-│   ├── setup-ingester.sh
-│   └── launchd/             plist templates
-├── ingester/                FastAPI ingester (pyproject + src)
-├── mcp-server/              MCP stdio server for search_brain
-├── windows/                 Claude Code shipper for Windows PC
-│   ├── ship-claude-code.ps1
-│   ├── ship-hidden.vbs
-│   ├── install-shipper.ps1
-│   └── README.md
-└── scripts/                 registration helpers
+┌────────────────────────┐      ┌────────────────────────────────┐
+│ Your desktop / laptop  │      │ Your always-on host (Mac Mini, │
+│ ──────────────         │      │ mini PC, or similar)           │
+│ Claude Code CLI        │      │ ─────────────────────────────  │
+│ Claude Desktop         │      │ Claude Code CLI                │
+│ Obsidian (read/write)  │      │ Obsidian (read/write)          │
+│ MCP brain (stdio)      │      │ MCP brain (stdio)              │
+│                        │      │                                │
+│ ┌─────────────────┐    │      │ Ingester (FastAPI :8765)       │
+│ │ Scheduled task  │    │      │  ├─ Claude Code watcher        │
+│ │ ships CC JSONLs │──sync──►  │  ├─ Inbox watcher              │
+│ │ to synced Brain │    │      │  └─ Dashboard + admin API      │
+│ └─────────────────┘    │      │                                │
+└────────────────────────┘      │ Ollama :11434                  │
+                                │   small-LLM:embed  (embeddings)│
+                                │   small-LLM:rerank (MCP search)│
+                                │   small-LLM:summarize (ingest) │
+                                │                                │
+                                │ llama.cpp :8081 (on-demand)    │
+                                │   large-MoE (heavy tier)       │
+                                └──────────┬─────────────────────┘
+                                           │ network
+                                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ NAS / server                                                     │
+│ ────────────                                                     │
+│ <vault-root>/Brain/                  ← vault (markdown)          │
+│   ├─ sessions/<source>/              per-conversation notes      │
+│   ├─ _inbox/                         drop zone for manual drops  │
+│   └─ .claude-code-sources/pc/        cross-machine CC JSONLs     │
+│                                                                  │
+│ Docker compose:                                                  │
+│   Postgres 16 + pgvector (port 5433)                             │
+│   tables: documents, chunks, ingestion_log                       │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-## Quickstart — fresh install
+The three-machine split is the reference deployment (one desktop + one always-on host + one storage host), but any subset of these can run on one box for a simpler setup.
 
-Assuming NAS Container Manager is installed and SSH key auth is set up:
+---
+
+## What goes in, and how
+
+| Source | Ingestion path |
+|---|---|
+| **Claude Code CLI** (local to the ingester) | Live watcher on `~/.claude/projects/**/*.jsonl` — sessions are picked up automatically 5 min after they go idle |
+| **Claude Code CLI on a different machine** | Scheduled task on that machine (examples provided for Windows PowerShell and Unix cron) copies finished JSONLs into a synced folder; ingester's multi-dir watcher picks them up |
+| **Claude web / Claude Desktop / Claude iOS** | One export → drop the ZIP into `<vault>/_inbox/`. Parser detects it, summarizes each conversation with your local LLM, indexes everything. Subsequent monthly exports dedup to just new content. |
+| **Grok** | Same pattern — export from x.ai account, drop into `_inbox/` |
+| **Any structured agent** | POST events to `/ingest/document` |
+| **Ad-hoc text, markdown, PDF** | Drop the file into `_inbox/` — parsed as a single document |
+
+---
+
+## What comes out
+
+Three retrieval surfaces against the same index:
+
+1. **`search_brain(query, limit, sources)`** — MCP tool. Returns top-K ~500-token chunks, each with source metadata. Gemma-E2B-class reranker scores candidates when your GPU isn't busy; falls back to pure ANN when it is.
+2. **`recent_sessions(n, source)`** — MCP tool. Chronological list of the most recently ingested documents.
+3. **Obsidian** — because the vault is a folder of markdown, every tool in the Obsidian ecosystem works on it. Graph view, backlinks, full-text search, plugins.
+
+---
+
+## Requirements
+
+### Hardware (reference setup)
+
+- **Always-on host:** an Apple Silicon Mac (16 GB+ unified memory recommended) or a Linux box with a GPU that can run small ~4B-parameter quantized LLMs locally. More RAM = less model-swap churn.
+- **Storage host:** anything running Docker. The Postgres DB is a few hundred MB for typical corpora; the vault is similar. A NAS with Docker/Container Manager is ideal but not required.
+- **Client machines:** whatever you use for daily work. Windows, macOS, or Linux.
+
+### Software
+
+- **Ingester + MCP server** — Python 3.11+, [`uv`](https://github.com/astral-sh/uv) for env management
+- **Local LLMs** — [Ollama](https://ollama.com/) for always-on small models; optional [`llama.cpp`](https://github.com/ggerganov/llama.cpp) for on-demand heavy tier
+- **Storage** — Postgres 16 + the [`pgvector`](https://github.com/pgvector/pgvector) extension, easiest via the `pgvector/pgvector:pg16` Docker image
+- **Editor** — [Obsidian](https://obsidian.md/) (optional but recommended for browsing the vault)
+- **Sync** — any two-way folder sync that works for you: Synology Drive, Syncthing, rsync, Dropbox, etc. goBrain is agnostic.
+
+### Models
+
+The reference config uses the **Gemma 3 / Gemma 4** family (E2B for rerank, E4B for summarization) and **nomic-embed-text** for embeddings — all Ollama pulls. The heavy tier uses Qwen 3.5 35B-A3B MoE via `llama.cpp`. All are swappable via config.
+
+---
+
+## Quickstart
+
+> The reference deploy is three hosts. You can collapse it to one machine by pointing everything at `localhost`.
 
 ```bash
-# 1. NAS — Postgres + pgvector
-ssh $NAS_USER@$NAS_IP "mkdir -p /volume1/docker/brain-db"
-scp compose/postgres/* $NAS_USER@$NAS_IP:/volume1/docker/brain-db/
-ssh $NAS_USER@$NAS_IP "cd /volume1/docker/brain-db && cp .env.example .env && vim .env && sudo docker compose up -d"
+# 1. Storage host — Postgres + pgvector
+cd compose/postgres
+cp .env.example .env
+# edit .env: set POSTGRES_PASSWORD (openssl rand -base64 32)
+docker compose up -d
 
-# 2. Mac Mini — LLM stack
+# 2. Always-on host — LLM stack
 cd mac-mini
-./setup-ollama.sh          # Ollama + Gemma 4 E2B, E4B + nomic-embed + LaunchAgent
-./setup-llamacpp.sh        # llama.cpp + Qwen 3.5 35B-A3B MoE on demand
+./setup-ollama.sh                   # pulls Gemma models + embed model, installs LaunchAgent
+./setup-llamacpp.sh                 # optional: heavy tier (13 GB model download)
 
-# 3. Mac Mini — ingester
+# 3. Always-on host — ingester
 cd ../ingester
-cp .env.example .env       # edit: vault path, Postgres DSN
+cp .env.example .env
+# edit .env: vault path, Postgres DSN pointing at storage host
 uv sync
 cd ../mac-mini
-./setup-ingester.sh        # installs LaunchAgent, verifies health
+./setup-ingester.sh                 # installs ingester as a LaunchAgent; verifies health
 
-# 4. Mac or PC — MCP server (per machine)
+# 4. Each client machine — MCP server
 cd ../mcp-server
-cp .env.example .env       # edit: Postgres DSN, Ollama base URL, vault path
+cp .env.example .env
+# edit: Postgres DSN, Ollama base URL (always-on host's LAN IP), local vault path
 uv sync
 claude mcp add brain --scope user -- uv run --directory $(pwd) brain-mcp
 
-# 5. Windows — Claude Code shipper
+# 5. (Optional) Windows client — Claude Code shipper
 cd ../windows
-.\install-shipper.ps1      # registers the every-10-min Scheduled Task
+.\install-shipper.ps1               # every-10-min scheduled task that ships finished JSONLs
 ```
 
-Full step-by-step in [docs/runbook.md](docs/runbook.md).
+Full step-by-step including troubleshooting in [docs/runbook.md](docs/runbook.md).
+
+---
 
 ## Common ops
 
-**Drop an export to ingest:**
+**Ingest a Claude.ai or Grok export:**
 ```bash
-mv ~/Downloads/<claude-ai-or-grok-export>.zip ~/Brain/_inbox/
-# Watcher picks it up within seconds; Gemma E4B summarizes each conversation.
+mv ~/Downloads/<export>.zip <vault>/_inbox/
+# Watcher picks it up. Per-conversation summaries arrive over the next minutes/hours.
 ```
 
-**Check ingest progress:**
+**Observe status in a dashboard:**
+```
+http://<ingester-host>:8765/dashboard
+```
+
+Zero-build HTML/JS dashboard served by the ingester itself — totals per source, 24h ingest velocity, recent documents, SQLite buffer depth. Polls every 5 seconds.
+
+**Check ingest progress from the command line:**
 ```bash
-curl -s http://127.0.0.1:8765/health | python3 -m json.tool
-# on NAS
+curl -s http://<ingester-host>:8765/health
 docker compose exec postgres psql -U brain -d brain -c \
   "SELECT source, count(*) FROM documents GROUP BY source ORDER BY count(*) DESC;"
 ```
 
-**Backfill every historical Claude Code session (e.g., after a Postgres wipe):**
+**Backfill historical Claude Code sessions:**
 ```bash
-curl -X POST http://127.0.0.1:8765/admin/reingest/claude-code
-# Runs in background by default. Watch ingester log for `reingest_*` events.
+curl -X POST http://<ingester-host>:8765/admin/reingest/claude-code
 ```
 
-**Re-process everything in `_inbox/`:**
+**Re-process everything in the inbox:**
 ```bash
-curl -X POST http://127.0.0.1:8765/admin/reingest/inbox
+curl -X POST http://<ingester-host>:8765/admin/reingest/inbox
 ```
 
-**Search from Claude Code (Mac or Windows):**
-> Use search_brain to find what we decided about Postgres migration.
+**Search from Claude Code (after MCP registration):**
+> Use search_brain to find what we decided about the auth migration.
 
-MCP tools exposed: `search_brain`, `recent_sessions`, `pluto_activity`, `get_document`.
+---
+
+## Documentation
+
+- [docs/architecture.md](docs/architecture.md) — design rationale, data model, model routing decisions
+- [docs/runbook.md](docs/runbook.md) — deploy + failure modes + recovery
+- [docs/model-routing.md](docs/model-routing.md) — which local LLM does what and why
+
+---
 
 ## Known caveats
 
-- **Synology Drive on-demand sync must be OFF** for the `Brain` Sync Task. When on, files sync as 0-byte placeholders on the Mac that Python can read but `zipfile.ZipFile` can't open properly (it seeks to EOF without triggering materialization). Flip it off in Drive Client → Selective Sync Settings → Sync Mode → uncheck "Enable On-demand Sync."
-- **`MAX_LOADED_MODELS=1` causes rerank contention** during bulk ingestion. MCP server detects this via `/api/ps` and falls back to raw ANN top-K (no rerank) so search stays responsive. Full rerank runs when nothing else is contending.
-- **Windows-shipped JSONLs require the dot-prefix toggle** ("Sync files and folders with the prefix '.'") in Drive Client Selective Sync. `.claude-code-sources` is dot-prefixed to hide it from Obsidian's sidebar.
-- **Claude Code watcher does not re-scan on startup** — it only catches modified files. Use the `/admin/reingest/claude-code` endpoint to backfill historical sessions.
+- **Synology Drive on-demand sync is incompatible with the inbox watcher.** Files sync as 0-byte placeholders that Python can read superficially but `zipfile.ZipFile` can't open properly. Disable "on-demand sync" on the Sync Task covering the vault. Documented in [docs/runbook.md](docs/runbook.md).
+- **`MAX_LOADED_MODELS=1` causes rerank contention** during bulk ingest. The MCP server detects this via Ollama's `/api/ps` and falls back to raw ANN top-K so search stays fast. Full rerank resumes automatically when nothing else is contending.
+- **Claude Code's local watcher does not re-scan on startup** — it only catches modified files. Use `/admin/reingest/claude-code` to backfill historical sessions after a fresh install or a Postgres wipe.
+- **Each machine running `claude-code` produces independent session files**. Cross-machine capture relies on a sync layer (Drive, Syncthing, etc.) putting all of them somewhere the ingester's multi-dir watcher can see.
+
+---
+
+## Contributing
+
+goBrain is built around a specific reference setup but the components are deliberately small and swappable. Contributions that keep the local-first / markdown-first ethos are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Report security issues per [SECURITY.md](SECURITY.md).
+
+---
 
 ## License
 
-Personal project. No license asserted yet.
+[MIT](LICENSE).
