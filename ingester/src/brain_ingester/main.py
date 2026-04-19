@@ -181,6 +181,28 @@ def create_app() -> FastAPI:
         await _runner()
         return {"ok": True, "files": len(files), "note": "see log for per-file results"}
 
+    @app.post("/admin/pluto/rollup")
+    async def pluto_rollup(target_date: str | None = None) -> dict:
+        """Run Pluto's daily rollup. `target_date` is ISO-8601 (YYYY-MM-DD);
+        defaults to yesterday (UTC). Pulls all pluto_events for that day, asks
+        Gemma E4B to summarize, writes a searchable markdown note into the
+        vault (source='pluto')."""
+        from datetime import date as _date
+        from .pluto_rollup import run_rollup
+
+        parsed: _date | None = None
+        if target_date:
+            try:
+                parsed = _date.fromisoformat(target_date)
+            except ValueError:
+                raise HTTPException(status_code=400,
+                                    detail=f"invalid target_date; use YYYY-MM-DD")
+
+        result = await run_rollup(parsed, ollama)
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail=result.get("error", "rollup failed"))
+        return result
+
     @app.post("/admin/reingest/inbox")
     async def reingest_inbox(background: bool = True) -> dict:
         """Re-process every file currently sitting in the inbox. Useful after
