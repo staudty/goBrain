@@ -138,17 +138,44 @@ JOIN pg_class c ON c.oid = s.indexrelid
 WHERE indexname = 'chunks_embedding_hnsw_idx';
 ```
 
+## Admin endpoints
+
+The ingester exposes a few admin operations:
+
+```bash
+# Drain SQLite buffer into Postgres (used when the ingester buffered writes
+# while Postgres was unreachable)
+curl -X POST http://127.0.0.1:8765/admin/drain-buffer
+
+# Re-ingest every Claude Code JSONL the ingester can see (primary + extra
+# directories). Dedup on (source, source_id, raw_hash) means already-ingested
+# sessions skip fast. Essential after a Postgres wipe, or for one-time
+# backfill of sessions that existed before the ingester was installed.
+curl -X POST http://127.0.0.1:8765/admin/reingest/claude-code
+# Add ?background=false if you want the curl to block until done.
+
+# Re-process every file currently in _inbox/. Useful for rebuilding summaries
+# for exports after a wipe.
+curl -X POST http://127.0.0.1:8765/admin/reingest/inbox
+```
+
 ## Failure modes & recovery
 
 | Symptom | Fix |
 |---|---|
 | Ingester 500s with "Postgres not configured" | Set `BRAIN_POSTGRES_DSN` in ingester `.env` and restart |
 | `search_brain` returns nothing, but docs exist | Check Ollama is up on port 11434; embed model present (`ollama list`) |
+| `search_brain` hangs for minutes during bulk ingest | Expected under contention. MCP server auto-falls back to raw ANN top-K (no rerank) if a non-rerank model is currently loaded in Ollama. If you still see hangs, verify MCP code is current (retrieval.py has `_rerank_feasible()`) |
+| `search_brain` returns stale / missing content after a Postgres wipe | Run `POST /admin/reingest/claude-code` to backfill local JSONLs; drop exports back into `_inbox/` for Claude.ai/Grok content |
+| Ingester hits `ReadTimeout` or `RemoteProtocolError` mid-batch | Fixed in current build: Ollama client timeout is 600s, and `inbox.py` catches per-conversation failures without aborting the whole batch. Verify the file you're ingesting is real (`du -h` shows actual bytes, not 0 B on-demand placeholder). |
 | llama.cpp OOM or swap | Context too large; reduce `--ctx-size` or use a smaller quant (`UD-IQ2_M`) |
 | Ingester runaway CPU | Thinking mode accidentally enabled; check `think: false` in Ollama calls |
 | Duplicates on re-ingest | Normal if `raw_hash` changed (content modified). Check ingestion_log for the "updated" row |
 | NAS Postgres unreachable | Ingester auto-buffers to SQLite. Verify via `GET /health`. Drain with `/admin/drain-buffer` when restored |
 | Synology Drive conflict | Resolve in DSM conflict UI; vault is markdown, safe to hand-merge |
+| Windows-shipped JSONLs not landing on Mac | In Drive Client → Selective Sync Settings → Sync Mode → check "Sync files and folders with the prefix '.'" (the shipper writes to `.claude-code-sources/`) |
+| Files on Mac show 0 bytes on `du -h` | Drive Client "Enable On-demand Sync" is on. Either (a) recreate the Sync Task with it off, or (b) `dd if=<file> of=/dev/null bs=1M` to force materialization |
+| Windows scheduled task shows as a flashing PowerShell window | The task was installed directly via `powershell.exe`. Re-run `install-shipper.ps1` — current version uses `wscript.exe ship-hidden.vbs` for a hidden invocation |
 
 ## Scaling notes
 
