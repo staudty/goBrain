@@ -31,7 +31,11 @@ class Hit:
 
 
 async def embed_query(query: str) -> list[float]:
-    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=30.0) as client:
+    # Long timeout: during bulk ingestion, the 16GB Mac Mini aggressively swaps
+    # between gemma4:e4b (summarization) and our embed/rerank models. A swap
+    # easily exceeds 30s of wall time. 600s is generous but keeps search
+    # reliable under load.
+    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=600.0) as client:
         r = await client.post("/api/embed", json={
             "model": settings.model_embed,
             "input": [query],
@@ -97,7 +101,7 @@ async def rerank(query: str, hits: list[Hit], keep: int) -> list[Hit]:
     if not hits:
         return []
 
-    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=60.0) as client:
+    async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=600.0) as client:
         scores: list[float] = []
         for h in hits:
             prompt = (

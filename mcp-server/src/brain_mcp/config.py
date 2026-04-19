@@ -18,7 +18,11 @@ class Settings(BaseSettings):
     model_embed: str = "nomic-embed-text"
 
     # Retrieval tuning
-    search_candidates: int = 20          # pgvector ANN top-K pulled before re-rank
+    # 8 candidates keeps rerank wall-time tolerable even under heavy Ollama
+    # contention (8 calls × ~1-2s warm = ~10-20s). 20 was fine when nothing
+    # else competed for the GPU, but during bulk ingestion that's a lot more
+    # model-swap thrashing. Override per-request via the `limit` param.
+    search_candidates: int = 8
     search_return_default: int = 5       # post-rerank default return size
     max_chunks_per_document: int = 2     # diversity cap
 
