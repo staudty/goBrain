@@ -60,6 +60,16 @@
       </div>
     </section>
 
+    <section class="bg-slate-900 border border-slate-800 rounded-xl p-5 mb-8">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm uppercase tracking-wider text-slate-400">Backfill progress</h2>
+        <span id="progress-summary" class="text-xs text-slate-500"></span>
+      </div>
+      <div id="progress-rows" class="space-y-4 text-sm">
+        <div class="text-slate-500">loading…</div>
+      </div>
+    </section>
+
     <section class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-8">
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 lg:col-span-2">
         <h2 class="text-sm uppercase tracking-wider text-slate-400 mb-4">Ingest velocity (last 24h)</h2>
@@ -230,6 +240,53 @@
       </span>`;
     }
 
+    function renderProgress(prog) {
+      const el = document.getElementById("progress-rows");
+      const summary = document.getElementById("progress-summary");
+      const sources = prog.sources || [];
+      if (!sources.length) {
+        el.innerHTML = `<div class="text-slate-500">no progress data yet</div>`;
+        summary.textContent = "";
+        return;
+      }
+
+      const totalIngested = sources.reduce((s, x) => s + (x.ingested || 0), 0);
+      const totalExpected = sources.reduce((s, x) => s + (x.total || 0), 0);
+      const overallPct = totalExpected ? Math.round(100 * totalIngested / totalExpected) : 100;
+      summary.textContent = totalExpected
+        ? `${totalIngested.toLocaleString()} / ${totalExpected.toLocaleString()} · ${overallPct}%`
+        : `${totalIngested.toLocaleString()} ingested`;
+
+      const inboxNote = prog.inbox
+        ? `<div class="text-xs text-slate-500 mt-2">inbox: ${prog.inbox.pending_files} pending · ${prog.inbox.processed_files} processed${prog.inbox.pending_names && prog.inbox.pending_names.length ? ` (${prog.inbox.pending_names.map(n => truncate(n, 40)).join(", ")})` : ""}</div>`
+        : "";
+
+      const rows = sources.map((s) => {
+        const color = sourceColor(s.source);
+        const pct = s.pct ?? 0;
+        const pending = s.pending_in_zips != null ? s.pending_in_zips : s.pending_estimate;
+        const detail = s.pending_in_zips != null
+          ? (pending ? `${pending} conversations still in inbox zips` : "all inbox zips drained")
+          : (pending ? `${pending} file${pending === 1 ? "" : "s"} not yet ingested` : "caught up");
+        return `
+          <div>
+            <div class="flex justify-between items-baseline mb-1">
+              <span class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full" style="background:${color}"></span>
+                <span class="font-medium">${s.source}</span>
+                <span class="text-xs text-slate-500">${detail}</span>
+              </span>
+              <span class="text-slate-400 font-mono text-xs">${(s.ingested ?? 0).toLocaleString()} / ${(s.total ?? 0).toLocaleString()} · ${pct}%</span>
+            </div>
+            <div class="w-full bg-slate-800 rounded-full h-2">
+              <div class="h-2 rounded-full transition-all" style="width:${pct}%;background:${color}"></div>
+            </div>
+          </div>`;
+      }).join("");
+
+      el.innerHTML = rows + inboxNote;
+    }
+
     function renderSystem(sys) {
       const overall = document.getElementById("system-overall");
       overall.textContent = sys.overall_ok ? "all systems go" : "degraded";
@@ -271,19 +328,22 @@
 
     async function refresh() {
       try {
-        const [countsRes, recentRes, timelineRes, systemRes] = await Promise.all([
+        const [countsRes, recentRes, timelineRes, systemRes, progressRes] = await Promise.all([
           fetch("/stats/counts"),
           fetch("/stats/recent?limit=25"),
           fetch("/stats/timeline?hours=24"),
           fetch("/stats/system"),
+          fetch("/stats/progress"),
         ]);
-        if (!countsRes.ok || !recentRes.ok || !timelineRes.ok || !systemRes.ok) throw new Error("non-200");
+        if (!countsRes.ok || !recentRes.ok || !timelineRes.ok || !systemRes.ok || !progressRes.ok) throw new Error("non-200");
         const counts = await countsRes.json();
         const recent = await recentRes.json();
         const timeline = await timelineRes.json();
         const system = await systemRes.json();
+        const progress = await progressRes.json();
 
         renderSystem(system);
+        renderProgress(progress);
 
         if (!counts.postgres_configured) {
           setHealth(false, "Postgres not configured — ingester is buffering to SQLite");

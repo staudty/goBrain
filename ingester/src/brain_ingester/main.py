@@ -40,6 +40,27 @@ from .writers import IngestInput, ingest_document
 _DASHBOARD_HTML = Path(__file__).parent / "dashboard.html"
 
 
+def _count_grok_conversations(zip_path: Path) -> int | None:
+    """Return number of conversations inside a Grok export zip, or None if
+    it isn't a Grok zip or can't be read."""
+    import json as _json
+    import zipfile as _zipfile
+
+    try:
+        with _zipfile.ZipFile(zip_path) as zf:
+            name = next(
+                (n for n in zf.namelist() if n.endswith("prod-grok-backend.json")),
+                None,
+            )
+            if not name:
+                return None
+            with zf.open(name) as f:
+                data = _json.load(f)
+        return len(data.get("conversations") or [])
+    except (OSError, _zipfile.BadZipFile, _json.JSONDecodeError, KeyError):
+        return None
+
+
 def _configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     structlog.configure(
@@ -248,7 +269,10 @@ def create_app() -> FastAPI:
             })
         result["watchers"] = watcher_rows
 
-        # Windows shipper — freshness of the synced Claude Code directory
+        # Windows shipper — freshness of the synced Claude Code directory.
+        # We can't observe the scheduled task from here, only its output. So
+        # "ok" means "we see files from the shipper"; the age is purely
+        # informational since an idle user produces no new finished sessions.
         shipper_status: dict[str, Any] = {}
         extra_dirs = list(settings.claude_code_extra_dirs)
         if extra_dirs:
@@ -269,16 +293,13 @@ def create_app() -> FastAPI:
                         latest_path = p
             shipper_status["watched_dirs"] = [str(d) for d in extra_dirs]
             shipper_status["files_seen"] = file_count
+            shipper_status["ok"] = file_count > 0
             if latest_mtime:
                 age = datetime.now(tz=timezone.utc).timestamp() - latest_mtime
                 shipper_status["last_sync_age_seconds"] = int(age)
                 shipper_status["last_sync_iso"] = datetime.fromtimestamp(latest_mtime, tz=timezone.utc).isoformat()
                 shipper_status["last_file"] = str(latest_path.name) if latest_path else None
-                # "ok" = we've seen a file within the shipper's interval + some grace.
-                # Default shipper runs every 10 min; 30 min is a generous "still alive" window.
-                shipper_status["ok"] = age < 30 * 60
             else:
-                shipper_status["ok"] = False
                 shipper_status["note"] = "no JSONLs observed in watched dirs"
         else:
             shipper_status["ok"] = True
@@ -294,6 +315,90 @@ def create_app() -> FastAPI:
         result["overall_ok"] = bool(required_ok)
 
         return result
+
+    @app.get("/stats/progress")
+    async def stats_progress() -> dict:
+        """Per-source progress: what's ingested vs what's still pending.
+
+        Fast: counts JSONL files on disk, counts files in _inbox/, parses
+        Grok zips' backend JSON for conversation counts. No embedding or
+        LLM calls.
+        """
+        out: dict[str, Any] = {"sources": []}
+        if not postgres_available():
+            return {"postgres_configured": False, "sources": []}
+
+        # Claude Code: compare JSONL files on disk to documents in DB.
+        cc_dirs = [settings.claude_code_projects_dir, *settings.claude_code_extra_dirs]
+        on_disk = 0
+        for d in cc_dirs:
+            if d.exists():
+                on_disk += sum(1 for _ in d.rglob("*.jsonl"))
+        with pg_session() as s:
+            cc_ingested = s.execute(
+                select(func.count(Document.id)).where(Document.source == "claude-code")
+            ).scalar_one()
+        cc = {
+            "source": "claude-code",
+            "ingested": cc_ingested,
+            "total": max(cc_ingested, on_disk),
+            "pending_estimate": max(0, on_disk - cc_ingested),
+        }
+        if cc["total"]:
+            cc["pct"] = round(100 * cc_ingested / cc["total"])
+        else:
+            cc["pct"] = 100
+        out["sources"].append(cc)
+
+        # Inbox (Grok + Claude.ai exports + ad-hoc files):
+        # count files still in _inbox/ vs files already in _processed/.
+        inbox = settings.inbox_path
+        pending_files = []
+        processed_files = 0
+        if inbox.exists():
+            for p in inbox.iterdir():
+                if p.is_file():
+                    pending_files.append(p)
+            processed_root = inbox / "_processed"
+            if processed_root.exists():
+                processed_files = sum(1 for _ in processed_root.rglob("*") if _.is_file())
+
+        out["inbox"] = {
+            "pending_files": len(pending_files),
+            "processed_files": processed_files,
+            "pending_names": [p.name for p in pending_files],
+        }
+
+        # Grok-specific: count conversations remaining inside each pending Grok
+        # zip so the user can see "435 of 448 imported" instead of just "1 file left".
+        pending_grok_conversations = 0
+        grok_zip_details = []
+        for p in pending_files:
+            if p.suffix.lower() != ".zip":
+                continue
+            convs = _count_grok_conversations(p)
+            if convs is None:
+                continue
+            grok_zip_details.append({"file": p.name, "conversations": convs})
+            pending_grok_conversations += convs
+
+        with pg_session() as s:
+            grok_ingested = s.execute(
+                select(func.count(Document.id)).where(Document.source == "grok")
+            ).scalar_one()
+
+        grok = {
+            "source": "grok",
+            "ingested": grok_ingested,
+            "pending_in_zips": pending_grok_conversations,
+            "zip_details": grok_zip_details,
+        }
+        expected = grok_ingested + pending_grok_conversations
+        grok["total"] = expected
+        grok["pct"] = round(100 * grok_ingested / expected) if expected else 100
+        out["sources"].append(grok)
+
+        return out
 
     @app.get("/stats/timeline")
     async def stats_timeline(hours: int = 24) -> dict:
