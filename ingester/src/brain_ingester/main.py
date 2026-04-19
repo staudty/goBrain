@@ -80,9 +80,15 @@ def create_app() -> FastAPI:
                  vault=str(settings.vault_path))
         if settings.watch_claude_code:
             background.append(asyncio.create_task(
-                claude_code_watcher.run(ollama, watchers_stop),
-                name="watcher-claude-code",
+                claude_code_watcher.run(ollama, watchers_stop,
+                                        root=settings.claude_code_projects_dir),
+                name="watcher-claude-code-primary",
             ))
+            for idx, extra in enumerate(settings.claude_code_extra_dirs):
+                background.append(asyncio.create_task(
+                    claude_code_watcher.run(ollama, watchers_stop, root=extra),
+                    name=f"watcher-claude-code-extra-{idx}",
+                ))
         if settings.watch_inbox:
             background.append(asyncio.create_task(
                 inbox_watcher.run(ollama, watchers_stop),

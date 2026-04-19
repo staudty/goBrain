@@ -38,11 +38,17 @@ class SessionState:
     first_seen_at: float = field(default_factory=time.monotonic)
 
 
-async def run(ollama: OllamaClient, stop: asyncio.Event) -> None:
-    root = settings.claude_code_projects_dir
+async def run(ollama: OllamaClient, stop: asyncio.Event, root: Path | None = None) -> None:
+    if root is None:
+        root = settings.claude_code_projects_dir
+    # Allow the directory to appear later (e.g., when a sync task first populates it)
     if not root.exists():
-        log.warning("claude_code_dir_missing", path=str(root))
-        return
+        log.info("claude_code_dir_waiting", path=str(root))
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            log.warning("claude_code_dir_mkdir_failed", path=str(root), error=str(exc))
+            return
 
     log.info("claude_code_watcher_start", root=str(root))
     sessions: dict[Path, SessionState] = {}

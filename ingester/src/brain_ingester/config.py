@@ -40,7 +40,18 @@ class Settings(BaseSettings):
 
     # --- Watcher toggles -----------------------------------------------------
     watch_claude_code: bool = True
+
+    # Primary Claude Code directory (this machine's own sessions).
     claude_code_projects_dir: Path = Path.home() / ".claude" / "projects"
+
+    # Additional Claude Code directories to watch (e.g., sessions shipped from
+    # a Windows PC into a synced Brain subfolder). Comma-separated paths in env.
+    # Each directory should mirror the same structure as ~/.claude/projects —
+    # <project-name>/<session-uuid>.jsonl.
+    claude_code_extra_dirs: list[Path] = [
+        Path.home() / "Brain" / ".claude-code-sources" / "pc",
+    ]
+
     watch_claude_desktop: bool = True
     watch_inbox: bool = True
     inbox_path: Path = Path.home() / "Brain" / "_inbox"
