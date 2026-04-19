@@ -18,19 +18,27 @@ param(
 $ErrorActionPreference = "Stop"
 
 $scriptPath = Join-Path $PSScriptRoot "ship-claude-code.ps1"
+$vbsPath    = Join-Path $PSScriptRoot "ship-hidden.vbs"
 if (-not (Test-Path $scriptPath)) {
     Write-Error "Expected ship-claude-code.ps1 next to this installer at: $scriptPath"
+    exit 1
+}
+if (-not (Test-Path $vbsPath)) {
+    Write-Error "Expected ship-hidden.vbs next to this installer at: $vbsPath"
     exit 1
 }
 
 Write-Host "Installing scheduled task: $TaskName"
 Write-Host "  Runs every $IntervalMinutes minutes"
-Write-Host "  Script: $scriptPath"
+Write-Host "  Launcher: $vbsPath (runs ship-claude-code.ps1 in a hidden window)"
 
-# Run PowerShell with the script in NonInteractive, no-profile, bypass-policy mode.
+# Launch via wscript.exe + a VBScript wrapper so no console window ever flashes
+# on screen every 10 minutes. powershell.exe directly would pop a visible
+# console window; the VBS wrapper calls it with hidden window style, and
+# wscript.exe itself has no console of its own.
 $action = New-ScheduledTaskAction `
-    -Execute "powershell.exe" `
-    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`""
+    -Execute "wscript.exe" `
+    -Argument "`"$vbsPath`""
 
 # Repeat every N minutes forever, starting 2 minutes from now.
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
