@@ -46,9 +46,12 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
     -MultipleInstances IgnoreNew
 
+# Interactive logon — runs as the current user when they're logged in. No
+# admin rights required (unlike S4U which runs even without a logged-in user
+# but requires the "Log on as a batch job" privilege).
 $principal = New-ScheduledTaskPrincipal `
     -UserId "$env:USERDOMAIN\$env:USERNAME" `
-    -LogonType S4U `
+    -LogonType Interactive `
     -RunLevel Limited
 
 # Replace any existing registration
@@ -57,13 +60,23 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger $trigger `
-    -Settings $settings `
-    -Principal $principal `
-    -Description "goBrain: every $IntervalMinutes min, copy finished Claude Code JSONL sessions from ~/.claude/projects to the synced Brain vault for ingestion." | Out-Null
+try {
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger $trigger `
+        -Settings $settings `
+        -Principal $principal `
+        -Description "goBrain: every $IntervalMinutes min, copy finished Claude Code JSONL sessions from ~/.claude/projects to the synced Brain vault for ingestion." `
+        -ErrorAction Stop | Out-Null
+} catch {
+    Write-Error "Failed to register scheduled task: $_"
+    Write-Host ""
+    Write-Host "If this says 'Access is denied', try one of:"
+    Write-Host "  1. Run PowerShell as Administrator and re-run this installer"
+    Write-Host "  2. Or install the task manually via Task Scheduler GUI using ship-claude-code.ps1"
+    exit 1
+}
 
 Write-Host ""
 Write-Host "Installed."
