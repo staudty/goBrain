@@ -70,16 +70,16 @@ async def _handle(path: Path, ollama: OllamaClient) -> None:
             else:
                 log.warning("inbox_zip_unknown_format", path=str(path))
                 return  # leave in _inbox so it can be inspected
-            for inp in parser.parse(path):
-                await ingest_document(inp, ollama)
-                count += 1
+            count, failed = await _ingest_each(parser.parse(path), ollama)
+            if failed:
+                log.warning("inbox_zip_partial", path=str(path), ok=count, failed=failed)
 
         elif ext == ".json":
             # Raw Grok backend JSON (someone extracted it from the zip)
             from ..parsers import grok as parser
-            for inp in parser.parse(path):
-                await ingest_document(inp, ollama)
-                count += 1
+            count, failed = await _ingest_each(parser.parse(path), ollama)
+            if failed:
+                log.warning("inbox_json_partial", path=str(path), ok=count, failed=failed)
 
         else:
             log.warning("inbox_unknown_type", path=str(path))
@@ -90,6 +90,29 @@ async def _handle(path: Path, ollama: OllamaClient) -> None:
 
     except Exception as exc:
         log.exception("inbox_handle_failed", path=str(path), error=repr(exc))
+
+
+async def _ingest_each(
+    inputs, ollama: OllamaClient
+) -> tuple[int, int]:
+    """Ingest a stream of IngestInput one at a time, catching per-item failures.
+
+    Returns (successful_count, failed_count). An Ollama connection hiccup or
+    any transient error on a single conversation is logged but does not abort
+    the batch — we keep trying the rest. Failed items stay ingestable later
+    via re-dropping the ZIP (dedup catches already-done ones)."""
+    ok = 0
+    fail = 0
+    for inp in inputs:
+        try:
+            await ingest_document(inp, ollama)
+            ok += 1
+        except Exception as exc:
+            log.exception("ingest_document_failed",
+                          source=inp.source, source_id=inp.source_id,
+                          error=repr(exc))
+            fail += 1
+    return ok, fail
 
 
 def _detect_zip_kind(path: Path) -> str | None:
