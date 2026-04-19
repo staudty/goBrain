@@ -61,6 +61,25 @@ def _count_grok_conversations(zip_path: Path) -> int | None:
         return None
 
 
+def _count_claude_ai_conversations(zip_path: Path) -> int | None:
+    """Return number of conversations inside a Claude.ai export zip, or
+    None if it isn't one. Claude.ai exports have a flat `conversations.json`
+    at the zip root (alongside users/projects/memories)."""
+    import json as _json
+    import zipfile as _zipfile
+
+    try:
+        with _zipfile.ZipFile(zip_path) as zf:
+            names = set(zf.namelist())
+            if "conversations.json" not in names:
+                return None
+            with zf.open("conversations.json") as f:
+                data = _json.load(f)
+        return len(data) if isinstance(data, list) else None
+    except (OSError, _zipfile.BadZipFile, _json.JSONDecodeError, KeyError):
+        return None
+
+
 def _configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     structlog.configure(
@@ -369,34 +388,56 @@ def create_app() -> FastAPI:
             "pending_names": [p.name for p in pending_files],
         }
 
-        # Grok-specific: count conversations remaining inside each pending Grok
-        # zip so the user can see "435 of 448 imported" instead of just "1 file left".
-        pending_grok_conversations = 0
-        grok_zip_details = []
+        # Inbox-zip backfill: count remaining conversations inside each
+        # pending zip so the bar shows conversation-level progress rather
+        # than "1 file left". Grok and Claude.ai have different zip shapes;
+        # dispatch per file.
+        pending_grok = 0
+        pending_claude_ai = 0
+        grok_details: list[dict] = []
+        claude_ai_details: list[dict] = []
         for p in pending_files:
             if p.suffix.lower() != ".zip":
                 continue
-            convs = _count_grok_conversations(p)
-            if convs is None:
+            g = _count_grok_conversations(p)
+            if g is not None:
+                grok_details.append({"file": p.name, "conversations": g})
+                pending_grok += g
                 continue
-            grok_zip_details.append({"file": p.name, "conversations": convs})
-            pending_grok_conversations += convs
+            c = _count_claude_ai_conversations(p)
+            if c is not None:
+                claude_ai_details.append({"file": p.name, "conversations": c})
+                pending_claude_ai += c
 
         with pg_session() as s:
             grok_ingested = s.execute(
                 select(func.count(Document.id)).where(Document.source == "grok")
             ).scalar_one()
+            claude_ai_ingested = s.execute(
+                select(func.count(Document.id)).where(Document.source == "claude-ai")
+            ).scalar_one()
 
         grok = {
             "source": "grok",
             "ingested": grok_ingested,
-            "pending_in_zips": pending_grok_conversations,
-            "zip_details": grok_zip_details,
+            "pending_in_zips": pending_grok,
+            "zip_details": grok_details,
         }
-        expected = grok_ingested + pending_grok_conversations
-        grok["total"] = expected
-        grok["pct"] = round(100 * grok_ingested / expected) if expected else 100
+        grok_total = grok_ingested + pending_grok
+        grok["total"] = grok_total
+        grok["pct"] = round(100 * grok_ingested / grok_total) if grok_total else 100
         out["sources"].append(grok)
+
+        claude_ai = {
+            "source": "claude-ai",
+            "ingested": claude_ai_ingested,
+            "pending_in_zips": pending_claude_ai,
+            "zip_details": claude_ai_details,
+        }
+        ca_total = claude_ai_ingested + pending_claude_ai
+        claude_ai["total"] = ca_total
+        claude_ai["pct"] = round(100 * claude_ai_ingested / ca_total) if ca_total else 100
+        out["sources"].append(claude_ai)
 
         return out
 
