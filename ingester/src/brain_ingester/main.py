@@ -138,6 +138,80 @@ def create_app() -> FastAPI:
         docs, events = drain_buffer()
         return {"ok": True, "docs_written": docs, "events_written": events}
 
+    @app.post("/admin/reingest/claude-code")
+    async def reingest_claude_code(background: bool = True) -> dict:
+        """Walk every Claude Code projects directory we watch and re-ingest every
+        JSONL file found, regardless of whether it's been ingested before.
+
+        Dedup (source, source_id) + raw_hash comparison means already-done
+        sessions with unchanged content are fast-skipped. Useful after a
+        Postgres wipe, or for picking up sessions that existed before the
+        ingester was installed (the live watcher only catches MODIFIED files).
+
+        `background=True` (default): returns immediately, processing runs as
+        an asyncio task. Watch the ingester log for `reingest_*` events.
+        `background=False`: blocks until done; suitable for scripts with a
+        long curl --max-time.
+        """
+        from .watchers.claude_code import _new_state, _ingest
+
+        dirs = [settings.claude_code_projects_dir, *settings.claude_code_extra_dirs]
+        dirs = [d for d in dirs if d.exists()]
+        files = []
+        for root in dirs:
+            files.extend((root, p) for p in sorted(root.rglob("*.jsonl")))
+
+        async def _runner():
+            log.info("reingest_started", source="claude-code", files=len(files))
+            stats = {"scanned": len(files), "ingested": 0, "failed": 0}
+            for root, path in files:
+                try:
+                    state = _new_state(path, root)
+                    await _ingest(state, ollama)
+                    stats["ingested"] += 1
+                except Exception as exc:
+                    log.exception("reingest_file_failed", path=str(path), error=repr(exc))
+                    stats["failed"] += 1
+            log.info("reingest_finished", source="claude-code", **stats)
+
+        if background:
+            asyncio.create_task(_runner(), name="reingest-claude-code")
+            return {"ok": True, "started": True, "files_queued": len(files)}
+
+        await _runner()
+        return {"ok": True, "files": len(files), "note": "see log for per-file results"}
+
+    @app.post("/admin/reingest/inbox")
+    async def reingest_inbox(background: bool = True) -> dict:
+        """Re-process every file currently sitting in the inbox. Useful after
+        a Postgres wipe to regenerate summaries/embeddings for dropped
+        exports, or to recover from a partial failure mid-batch."""
+        from .watchers.inbox import _handle as inbox_handle
+
+        inbox = settings.inbox_path
+        if not inbox.exists():
+            raise HTTPException(status_code=400, detail=f"inbox path not found: {inbox}")
+        files = sorted([p for p in inbox.iterdir() if p.is_file()])
+
+        async def _runner():
+            log.info("reingest_started", source="inbox", files=len(files))
+            stats = {"scanned": len(files), "handled": 0, "failed": 0}
+            for path in files:
+                try:
+                    await inbox_handle(path, ollama)
+                    stats["handled"] += 1
+                except Exception as exc:
+                    log.exception("reingest_inbox_file_failed", path=str(path), error=repr(exc))
+                    stats["failed"] += 1
+            log.info("reingest_finished", source="inbox", **stats)
+
+        if background:
+            asyncio.create_task(_runner(), name="reingest-inbox")
+            return {"ok": True, "started": True, "files_queued": len(files)}
+
+        await _runner()
+        return {"ok": True, "files": len(files), "note": "see log for per-file results"}
+
     return app
 
 
