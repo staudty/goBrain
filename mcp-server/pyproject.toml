@@ -12,10 +12,13 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
     "structlog>=24.4",
+    "starlette>=0.37",
+    "uvicorn[standard]>=0.30",
 ]
 
 [project.scripts]
 brain-mcp = "brain_mcp.server:run"
+brain-mcp-http = "brain_mcp.http_server:run"
 
 [build-system]
 requires = ["hatchling"]

@@ -28,5 +28,12 @@ class Settings(BaseSettings):
 
     vault_path: Path = Path.home() / "Brain"
 
+    # Remote HTTP transport — only used by `brain-mcp-http` (Claude iOS and
+    # other remote MCP clients). The stdio transport (`brain-mcp`) doesn't
+    # touch these.
+    http_host: str = "127.0.0.1"         # bind-host; keep loopback behind TLS proxy
+    http_port: int = 8766
+    remote_bearer_token: str | None = None  # required by http_server.py to start
+
 
 settings = Settings()

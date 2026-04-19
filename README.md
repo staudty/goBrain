@@ -197,6 +197,7 @@ curl -X POST http://<ingester-host>:8765/admin/reingest/inbox
 - [docs/architecture.md](docs/architecture.md) — design rationale, data model, model routing decisions
 - [docs/runbook.md](docs/runbook.md) — deploy + failure modes + recovery
 - [docs/model-routing.md](docs/model-routing.md) — which local LLM does what and why
+- [docs/remote-mcp.md](docs/remote-mcp.md) — exposing goBrain to Claude iOS / cloud clients via HTTPS
 
 ---
 
