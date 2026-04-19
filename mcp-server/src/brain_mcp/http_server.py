@@ -87,18 +87,21 @@ def _build_app() -> Starlette:
 
     from starlette.routing import Route
 
-    # redirect_slashes=False: Streamable HTTP clients POST to exactly /mcp.
-    # Default Starlette routing would 307 that to /mcp/, which curl -X POST
-    # won't follow and Claude iOS won't honor either.
-    return Starlette(
+    starlette_app = Starlette(
         routes=[
             Route("/health", _health, methods=["GET"]),
             Mount("/mcp", app=mcp_endpoint),
         ],
         middleware=[Middleware(BearerAuthMiddleware, token=token)],
         lifespan=lifespan,
-        redirect_slashes=False,
     )
+    # Streamable HTTP clients POST to exactly /mcp. Default Starlette
+    # routing 307-redirects that to /mcp/, which curl -X POST won't
+    # follow and Claude iOS won't honor either. Turn it off on the
+    # router directly (the Starlette constructor didn't accept this
+    # kwarg until ~0.38).
+    starlette_app.router.redirect_slashes = False
+    return starlette_app
 
 
 def run() -> None:
