@@ -105,10 +105,42 @@ ingress:
   - service: http_status:404
 ```
 
-Install as a service:
+Install as a service — **but note the macOS gotcha**:
 ```bash
 sudo cloudflared service install
 ```
+
+On macOS, `service install` creates a LaunchDaemon stub with **no tunnel
+arguments** and points at `/etc/cloudflared/config.yml` (a root-owned
+path that doesn't exist yet). Two fixes are needed before the daemon
+can actually run your tunnel:
+
+```bash
+# 1. Copy config + credentials from your user home into the system path
+sudo mkdir -p /etc/cloudflared
+sudo cp ~/.cloudflared/config.yml /etc/cloudflared/
+sudo cp ~/.cloudflared/<tunnel-uuid>.json /etc/cloudflared/
+
+# 2. Update the daemon plist's ProgramArguments so it actually runs the tunnel.
+#    Edit /Library/LaunchDaemons/com.cloudflare.cloudflared.plist and make
+#    ProgramArguments look like:
+#      /opt/homebrew/bin/cloudflared
+#      --config
+#      /etc/cloudflared/config.yml
+#      tunnel
+#      run
+
+# 3. Reload
+sudo launchctl unload /Library/LaunchDaemons/com.cloudflare.cloudflared.plist
+sudo launchctl load /Library/LaunchDaemons/com.cloudflare.cloudflared.plist
+```
+
+Verify with `curl https://brain.your-domain.tld/health` — should
+return `{"ok":true}` once the tunnel registers with Cloudflare (5-10s).
+
+> On Linux with systemd, `cloudflared service install` Just Works and
+> reads `/etc/cloudflared/config.yml` directly. The macOS stub plist
+> quirk is specific to the Homebrew / LaunchDaemon path.
 
 For extra security, optionally turn on **Cloudflare Access** on that
 hostname with a Google/GitHub/email-OTP policy — then bearer token and
