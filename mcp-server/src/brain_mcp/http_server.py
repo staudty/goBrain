@@ -35,6 +35,23 @@ logging.basicConfig(level=logging.INFO)
 log = structlog.get_logger(__name__)
 
 
+class McpPathNormalizeMiddleware:
+    """Starlette's Mount('/mcp', ...) matches '/mcp/<x>' but returns 404 for
+    exact '/mcp'. Claude iOS and other Streamable-HTTP clients POST to the
+    bare '/mcp' URL, so we rewrite the scope path before routing."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path") == "/mcp":
+            scope = dict(scope)
+            scope["path"] = "/mcp/"
+            if scope.get("raw_path") == b"/mcp":
+                scope["raw_path"] = b"/mcp/"
+        await self.app(scope, receive, send)
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Reject any request whose Authorization header doesn't match the
     configured bearer token. Skips /health so reverse-proxies can probe."""
@@ -105,8 +122,11 @@ def _build_app() -> Starlette:
 
 
 def run() -> None:
+    # Wrap the Starlette app in the path-normalizer so '/mcp' and '/mcp/'
+    # both land on the Streamable HTTP session manager.
+    asgi_app = McpPathNormalizeMiddleware(_build_app())
     uvicorn.run(
-        _build_app(),
+        asgi_app,
         host=settings.http_host,
         port=settings.http_port,
         log_level="info",
