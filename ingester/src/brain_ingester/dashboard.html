@@ -30,6 +30,16 @@
       </div>
     </header>
 
+    <section class="bg-slate-900 border border-slate-800 rounded-xl p-5 mb-8">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm uppercase tracking-wider text-slate-400">System health</h2>
+        <span id="system-overall" class="text-xs font-medium text-slate-400">checking…</span>
+      </div>
+      <div id="system-pills" class="flex flex-wrap gap-2">
+        <span class="text-sm text-slate-500">loading…</span>
+      </div>
+    </section>
+
     <section class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
         <div class="text-xs uppercase tracking-wider text-slate-400">Total documents</div>
@@ -208,20 +218,77 @@
       `).join("");
     }
 
+    function pill(label, ok, detail, optional) {
+      const bg = ok ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-300"
+                    : (optional ? "bg-slate-700/40 border-slate-600/60 text-slate-300"
+                                : "bg-rose-500/15 border-rose-500/50 text-rose-300");
+      const dot = ok ? "bg-emerald-400" : (optional ? "bg-slate-500" : "bg-rose-500");
+      const title = detail ? ` title="${detail.replace(/"/g, "&quot;")}"` : "";
+      return `<span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-medium ${bg}"${title}>
+        <span class="w-1.5 h-1.5 rounded-full ${dot}"></span>
+        ${label}${detail ? `<span class="text-slate-400 font-normal ml-1">${detail}</span>` : ""}
+      </span>`;
+    }
+
+    function renderSystem(sys) {
+      const overall = document.getElementById("system-overall");
+      overall.textContent = sys.overall_ok ? "all systems go" : "degraded";
+      overall.className = "text-xs font-medium " + (sys.overall_ok ? "text-emerald-400" : "text-rose-400");
+
+      const pills = [];
+      pills.push(pill("Ingester", true, "running"));
+      const pg = sys.postgres || {};
+      const pgDetail = pg.buffered ? `buffer: ${pg.buffered}` : (pg.error || (pg.ok ? "reachable" : "not configured"));
+      pills.push(pill("Postgres", !!pg.ok, pgDetail));
+
+      const ol = sys.ollama || {};
+      let olDetail;
+      if (!ol.ok) {
+        olDetail = ol.missing && ol.missing.length ? `missing: ${ol.missing.join(", ")}` : (ol.error || "unreachable");
+      } else {
+        olDetail = ol.loaded_now && ol.loaded_now.length
+          ? `loaded: ${ol.loaded_now.join(", ")}`
+          : "all models installed, none loaded";
+      }
+      pills.push(pill("Ollama", !!ol.ok, olDetail));
+
+      const lc = sys.llamacpp || {};
+      pills.push(pill("llama.cpp", !!lc.ok, lc.ok ? "heavy tier online" : "heavy tier offline (optional)", true));
+
+      const ship = sys.windows_shipper || {};
+      let shipDetail;
+      if (ship.note) shipDetail = ship.note;
+      else if (ship.last_sync_iso) shipDetail = `last sync: ${relTime(ship.last_sync_iso)} · ${ship.files_seen} files`;
+      else shipDetail = "unknown";
+      pills.push(pill("Windows shipper", !!ship.ok, shipDetail, !!ship.note && ship.note.includes("no extra")));
+
+      (sys.watchers || []).forEach((w) => {
+        pills.push(pill(w.name, !!w.ok, w.ok ? "watching" : (w.error || "stopped")));
+      });
+
+      document.getElementById("system-pills").innerHTML = pills.join("");
+    }
+
     async function refresh() {
       try {
-        const [countsRes, recentRes, timelineRes] = await Promise.all([
+        const [countsRes, recentRes, timelineRes, systemRes] = await Promise.all([
           fetch("/stats/counts"),
           fetch("/stats/recent?limit=25"),
           fetch("/stats/timeline?hours=24"),
+          fetch("/stats/system"),
         ]);
-        if (!countsRes.ok || !recentRes.ok || !timelineRes.ok) throw new Error("non-200");
+        if (!countsRes.ok || !recentRes.ok || !timelineRes.ok || !systemRes.ok) throw new Error("non-200");
         const counts = await countsRes.json();
         const recent = await recentRes.json();
         const timeline = await timelineRes.json();
+        const system = await systemRes.json();
+
+        renderSystem(system);
 
         if (!counts.postgres_configured) {
           setHealth(false, "Postgres not configured — ingester is buffering to SQLite");
+        } else if (!system.overall_ok) {
+          setHealth(false, "online · some components degraded");
         } else {
           setHealth(true, "online");
         }

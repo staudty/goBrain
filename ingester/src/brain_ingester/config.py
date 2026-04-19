@@ -60,5 +60,12 @@ class Settings(BaseSettings):
     chunk_target_tokens: int = 500
     chunk_overlap_tokens: int = 100
 
+    # --- Source-specific filters --------------------------------------------
+    # Grok "Companion" chats (roleplay personas like Ani and Mika) should be
+    # skipped during ingestion. Title pattern match: "Chat with <name>" or
+    # "Greeting <name>, ...". Override via BRAIN_GROK_COMPANION_NAMES (comma
+    # or JSON list).
+    grok_companion_names: list[str] = ["Ani", "Mika", "Valentine", "Rudi"]
+
 
 settings = Settings()

@@ -32,12 +32,18 @@ are MongoDB extended-JSON objects. We handle both.
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+import structlog
+
+from ..config import settings
 from ..writers import IngestInput
+
+log = structlog.get_logger(__name__)
 
 
 def parse(path: Path) -> Iterator[IngestInput]:
@@ -45,10 +51,17 @@ def parse(path: Path) -> Iterator[IngestInput]:
     if data is None:
         return
 
+    companion_pattern = _companion_title_pattern()
+
     for wrapper in data.get("conversations", []):
         conv = wrapper.get("conversation") or {}
         responses = wrapper.get("responses") or []
         if not responses:
+            continue
+
+        title = conv.get("title") or ""
+        if companion_pattern and companion_pattern.match(title):
+            log.info("grok_companion_skipped", title=title, conv_id=conv.get("id"))
             continue
 
         body_parts: list[str] = []
@@ -74,6 +87,20 @@ def parse(path: Path) -> Iterator[IngestInput]:
             model=last_model,
             turn_count=len(responses),
         )
+
+
+def _companion_title_pattern() -> re.Pattern | None:
+    """Build a regex matching Grok companion-chat titles for configured names.
+
+    Grok's companion chats use stable opener titles like "Chat with Ani" or
+    "Greeting Mika, ...". We match those by verb + companion name at the
+    start; the user's own conversations rarely share this shape.
+    """
+    names = [n.strip() for n in settings.grok_companion_names if n.strip()]
+    if not names:
+        return None
+    alt = "|".join(re.escape(n) for n in names)
+    return re.compile(rf"^(Chat with|Greeting)\s+({alt})\b", re.IGNORECASE)
 
 
 def _load_backend_json(path: Path):

@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -183,6 +184,116 @@ def create_app() -> FastAPI:
                 for r in rows
             ],
         }
+
+    @app.get("/stats/system")
+    async def stats_system() -> dict:
+        """System health: everything upstream + downstream of this process."""
+        result: dict[str, Any] = {"ingester": {"ok": True}}
+
+        # Postgres
+        pg_status: dict[str, Any] = {"configured": postgres_available(), "buffered": buffer_size()}
+        if postgres_available():
+            try:
+                with pg_session() as s:
+                    s.execute(text("SELECT 1"))
+                pg_status["ok"] = True
+            except Exception as exc:
+                pg_status["ok"] = False
+                pg_status["error"] = str(exc)[:200]
+        else:
+            pg_status["ok"] = False
+        result["postgres"] = pg_status
+
+        # Ollama — tags (installed models) + ps (currently loaded)
+        ollama_status: dict[str, Any] = {"base_url": settings.ollama_base_url}
+        expected = [settings.model_fast, settings.model_primary, settings.model_embed]
+        ollama_status["expected_models"] = expected
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as h:
+                tags_r = await h.get(f"{settings.ollama_base_url}/api/tags")
+                tags_r.raise_for_status()
+                installed = {m.get("name") or m.get("model") for m in tags_r.json().get("models", [])}
+                installed.discard(None)
+                ps_r = await h.get(f"{settings.ollama_base_url}/api/ps")
+                ps_r.raise_for_status()
+                loaded = [m.get("name") or m.get("model") for m in ps_r.json().get("models", [])]
+            missing = [m for m in expected if m not in installed and f"{m}:latest" not in installed]
+            ollama_status["ok"] = not missing
+            ollama_status["installed_count"] = len(installed)
+            ollama_status["missing"] = missing
+            ollama_status["loaded_now"] = loaded
+        except Exception as exc:
+            ollama_status["ok"] = False
+            ollama_status["error"] = str(exc)[:200]
+        result["ollama"] = ollama_status
+
+        # llama.cpp — optional heavy tier; 'ok' only when we can reach it
+        llama_status: dict[str, Any] = {"base_url": settings.llamacpp_base_url, "optional": True}
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as h:
+                r = await h.get(f"{settings.llamacpp_base_url}/v1/models")
+                r.raise_for_status()
+            llama_status["ok"] = True
+        except Exception:
+            llama_status["ok"] = False
+        result["llamacpp"] = llama_status
+
+        # Watchers — asyncio tasks we spawned at startup
+        watcher_rows = []
+        for t in background:
+            watcher_rows.append({
+                "name": t.get_name(),
+                "ok": not t.done(),
+                "error": (repr(t.exception()) if t.done() and not t.cancelled() and t.exception() else None),
+            })
+        result["watchers"] = watcher_rows
+
+        # Windows shipper — freshness of the synced Claude Code directory
+        shipper_status: dict[str, Any] = {}
+        extra_dirs = list(settings.claude_code_extra_dirs)
+        if extra_dirs:
+            latest_mtime = 0.0
+            latest_path = None
+            file_count = 0
+            for d in extra_dirs:
+                if not d.exists():
+                    continue
+                for p in d.rglob("*.jsonl"):
+                    file_count += 1
+                    try:
+                        m = p.stat().st_mtime
+                    except OSError:
+                        continue
+                    if m > latest_mtime:
+                        latest_mtime = m
+                        latest_path = p
+            shipper_status["watched_dirs"] = [str(d) for d in extra_dirs]
+            shipper_status["files_seen"] = file_count
+            if latest_mtime:
+                age = datetime.now(tz=timezone.utc).timestamp() - latest_mtime
+                shipper_status["last_sync_age_seconds"] = int(age)
+                shipper_status["last_sync_iso"] = datetime.fromtimestamp(latest_mtime, tz=timezone.utc).isoformat()
+                shipper_status["last_file"] = str(latest_path.name) if latest_path else None
+                # "ok" = we've seen a file within the shipper's interval + some grace.
+                # Default shipper runs every 10 min; 30 min is a generous "still alive" window.
+                shipper_status["ok"] = age < 30 * 60
+            else:
+                shipper_status["ok"] = False
+                shipper_status["note"] = "no JSONLs observed in watched dirs"
+        else:
+            shipper_status["ok"] = True
+            shipper_status["note"] = "no extra Claude Code dirs configured"
+        result["windows_shipper"] = shipper_status
+
+        # Overall roll-up
+        required_ok = (
+            pg_status["ok"]
+            and ollama_status.get("ok")
+            and all(w["ok"] for w in watcher_rows)
+        )
+        result["overall_ok"] = bool(required_ok)
+
+        return result
 
     @app.get("/stats/timeline")
     async def stats_timeline(hours: int = 24) -> dict:
