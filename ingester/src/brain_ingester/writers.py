@@ -1,4 +1,4 @@
-"""Write pipeline: vault markdown + Postgres documents/chunks/pluto rows.
+"""Write pipeline: vault markdown + Postgres documents/chunks rows.
 
 Idempotent: on duplicate (source, source_id), updates raw_hash if changed
 and re-embeds chunks; otherwise skips.
@@ -17,8 +17,8 @@ from sqlalchemy import select
 
 from .chunker import chunk_text
 from .config import settings
-from .db import buffer_document, buffer_pluto_event, pg_session, postgres_available
-from .models import Chunk, Document, IngestionLog, PlutoEvent
+from .db import buffer_document, pg_session, postgres_available
+from .models import Chunk, Document, IngestionLog
 from .ollama_client import OllamaClient
 from .summarizer import Summary, summarize_conversation
 
@@ -27,7 +27,7 @@ log = structlog.get_logger(__name__)
 
 @dataclass
 class IngestInput:
-    source: str                # claude-code | claude-desktop | claude-ai | grok | pluto | inbox | telegram
+    source: str                # claude-code | claude-desktop | claude-ai | grok | inbox | telegram
     source_id: str             # stable id for dedup
     conversation_text: str     # cleaned, human-readable body (markdown ok)
     started_at: datetime | None = None
@@ -199,44 +199,7 @@ def _write_to_postgres(doc: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Buffer replay hooks (called by db.drain_buffer)
+# Buffer replay hook (called by db.drain_buffer)
 # ---------------------------------------------------------------------------
 def replay_buffered_document(source: str, source_id: str, payload: dict) -> None:
     _write_to_postgres(payload)
-
-
-def replay_buffered_pluto_event(ts: str, payload: dict) -> None:
-    with pg_session() as session:
-        session.add(PlutoEvent(
-            id=str(uuid.uuid4()),
-            ts=datetime.fromisoformat(ts),
-            kind=payload["kind"],
-            tool_name=payload.get("tool_name"),
-            parent_session_id=payload.get("parent_session_id"),
-            payload=payload.get("payload"),
-            summary=None,
-            ingested_at=datetime.now(timezone.utc),
-        ))
-        session.commit()
-
-
-# ---------------------------------------------------------------------------
-# Pluto event writer (live, not batched)
-# ---------------------------------------------------------------------------
-async def record_pluto_event(event: dict) -> None:
-    ts = event.get("ts") or datetime.now(timezone.utc).isoformat()
-    if postgres_available():
-        with pg_session() as session:
-            session.add(PlutoEvent(
-                id=str(uuid.uuid4()),
-                ts=datetime.fromisoformat(ts) if isinstance(ts, str) else ts,
-                kind=event["kind"],
-                tool_name=event.get("tool_name"),
-                parent_session_id=event.get("parent_session_id"),
-                payload=event.get("payload"),
-                summary=None,
-                ingested_at=datetime.now(timezone.utc),
-            ))
-            session.commit()
-    else:
-        buffer_pluto_event(ts, event)

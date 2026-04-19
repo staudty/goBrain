@@ -237,38 +237,6 @@ def recent_documents(n: int, source: str | None = None) -> list[dict]:
     ]
 
 
-def pluto_activity(since_iso: str | None, tool: str | None) -> list[dict]:
-    params: dict = {}
-    where: list[str] = []
-    if since_iso:
-        where.append("ts >= :since")
-        params["since"] = since_iso
-    if tool:
-        where.append("tool_name = :tool")
-        params["tool"] = tool
-    where_sql = "WHERE " + " AND ".join(where) if where else ""
-    sql = text(f"""
-        SELECT ts, kind, tool_name, parent_session_id, payload, summary
-        FROM pluto_events
-        {where_sql}
-        ORDER BY ts DESC
-        LIMIT 500
-    """)
-    with _Session() as session:
-        rows = session.execute(sql, params).mappings().all()
-    return [
-        {
-            "ts": r["ts"].isoformat(),
-            "kind": r["kind"],
-            "tool_name": r["tool_name"],
-            "parent_session_id": r["parent_session_id"],
-            "payload": r["payload"],
-            "summary": r["summary"],
-        }
-        for r in rows
-    ]
-
-
 def get_document_text(vault_path: str) -> str:
     abs_path = settings.vault_path / vault_path
     if not abs_path.exists():

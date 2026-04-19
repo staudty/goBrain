@@ -67,20 +67,6 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
-            name="pluto_activity",
-            description=(
-                "Retrieve Pluto's recent tool calls and outcomes. Use when asked what Pluto "
-                "did or is doing."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "since": {"type": "string", "description": "ISO timestamp lower bound."},
-                    "tool": {"type": "string", "description": "Optional tool name filter."},
-                },
-            },
-        ),
-        Tool(
             name="get_document",
             description=(
                 "Fetch the full markdown of a specific vault document by its vault_path. "
@@ -120,11 +106,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             payload = retrieval.recent_documents(
                 n=int(arguments.get("n", 10)),
                 source=arguments.get("source"),
-            )
-        elif name == "pluto_activity":
-            payload = retrieval.pluto_activity(
-                since_iso=arguments.get("since"),
-                tool=arguments.get("tool"),
             )
         elif name == "get_document":
             payload = {"content": retrieval.get_document_text(arguments["vault_path"])}

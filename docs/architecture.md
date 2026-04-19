@@ -83,20 +83,11 @@ chunks (
   embedding vector(768)              -- nomic-embed-text dimension
 );
 
-pluto_events (
-  id uuid primary key,
-  ts timestamptz not null,
-  kind text not null,                -- tool_call | tool_result | message_in | message_out | error
-  tool_name text,
-  payload jsonb,
-  summary text                       -- Gemma-written, populated by nightly rollup
-);
 ```
 
 Indexes:
 - `chunks (embedding)` via HNSW for fast ANN search
 - `documents (source, started_at desc)` for recency queries
-- `pluto_events (ts desc)`, `pluto_events (tool_name)`
 - GIN index on `documents.tags`
 
 ### Nothing is thrown away

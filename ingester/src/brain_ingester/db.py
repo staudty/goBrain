@@ -1,7 +1,7 @@
 """Storage layer. Dual-mode: Postgres when configured, SQLite buffer otherwise.
 
 The SQLite buffer mirrors the Postgres schema loosely — just enough to queue
-ingested documents and chunks until Postgres is reachable, at which point
+ingested documents until Postgres is reachable, at which point
 `drain_buffer()` replays them.
 """
 from __future__ import annotations
@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Iterator
 
 import structlog
@@ -59,12 +58,6 @@ CREATE TABLE IF NOT EXISTS buffered_documents (
   queued_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (source, source_id)
 );
-
-CREATE TABLE IF NOT EXISTS buffered_pluto_events (
-  ts           TEXT NOT NULL,
-  payload_json TEXT NOT NULL,
-  queued_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
 """
 
 
@@ -84,36 +77,25 @@ def buffer_document(source: str, source_id: str, payload: dict) -> None:
         )
 
 
-def buffer_pluto_event(ts: str, payload: dict) -> None:
-    with _buffer_conn() as conn:
-        conn.execute(
-            "INSERT INTO buffered_pluto_events (ts, payload_json) VALUES (?, ?)",
-            (ts, json.dumps(payload, default=str)),
-        )
-
-
-def buffer_size() -> tuple[int, int]:
+def buffer_size() -> int:
     with _buffer_conn() as conn:
         (docs,) = conn.execute("SELECT COUNT(*) FROM buffered_documents").fetchone()
-        (events,) = conn.execute("SELECT COUNT(*) FROM buffered_pluto_events").fetchone()
-    return docs, events
+    return docs
 
 
-def drain_buffer() -> tuple[int, int]:
-    """Replay buffered docs + events into Postgres. Returns (docs_written, events_written)."""
+def drain_buffer() -> int:
+    """Replay buffered docs into Postgres. Returns docs_written."""
     if not postgres_available():
         log.warning("drain_buffer called but Postgres not configured")
-        return 0, 0
+        return 0
 
-    # Actual replay is implemented alongside the writer functions (see writers.py).
-    # Placeholder here; Phase 6 (Thursday) wires it up.
-    from .writers import replay_buffered_document, replay_buffered_pluto_event
+    from .writers import replay_buffered_document
 
-    docs_written = events_written = 0
+    docs_written = 0
     with _buffer_conn() as conn:
         for source, source_id, payload_json in conn.execute(
             "SELECT source, source_id, payload_json FROM buffered_documents"
-        ):
+        ).fetchall():
             try:
                 replay_buffered_document(source, source_id, json.loads(payload_json))
                 conn.execute(
@@ -124,14 +106,4 @@ def drain_buffer() -> tuple[int, int]:
             except Exception as exc:
                 log.error("replay_failed", source=source, source_id=source_id, error=str(exc))
 
-        for (ts, payload_json) in conn.execute(
-            "SELECT ts, payload_json FROM buffered_pluto_events ORDER BY ts"
-        ).fetchall():
-            try:
-                replay_buffered_pluto_event(ts, json.loads(payload_json))
-                events_written += 1
-            except Exception as exc:
-                log.error("pluto_replay_failed", ts=ts, error=str(exc))
-        conn.execute("DELETE FROM buffered_pluto_events")
-
-    return docs_written, events_written
+    return docs_written

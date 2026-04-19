@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -14,7 +13,7 @@ from sqlalchemy import (
     TIMESTAMP,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from .config import settings
@@ -61,19 +60,6 @@ class Chunk(Base):
     embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.embed_dim))
 
     document: Mapped[Document] = relationship(back_populates="chunks")
-
-
-class PlutoEvent(Base):
-    __tablename__ = "pluto_events"
-
-    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True)
-    ts: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
-    kind: Mapped[str] = mapped_column(String, nullable=False)
-    tool_name: Mapped[str | None] = mapped_column(String)
-    parent_session_id: Mapped[str | None] = mapped_column(String)
-    payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    summary: Mapped[str | None] = mapped_column(Text)
-    ingested_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True))
 
 
 class IngestionLog(Base):

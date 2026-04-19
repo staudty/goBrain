@@ -1,17 +1,17 @@
 """FastAPI entry point for the ingester.
 
 Endpoints:
-  POST /ingest/document        — generic, for remote shippers (e.g. Windows PC Claude Code)
-  POST /ingest/pluto-event     — structured tool-call events from Pluto
-  POST /admin/drain-buffer     — replay SQLite buffer into Postgres
-  GET  /health                 — simple heartbeat + buffer stats
+  POST /ingest/document                 — generic, for remote shippers (e.g. Windows PC Claude Code)
+  POST /admin/drain-buffer              — replay SQLite buffer into Postgres
+  POST /admin/reingest/claude-code      — backfill every Claude Code JSONL we can see
+  POST /admin/reingest/inbox            — re-process everything currently in _inbox/
+  GET  /health                          — simple heartbeat + buffer stats
 
 Plus long-running watcher tasks (Claude Code JSONL + _inbox folder).
 """
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from datetime import datetime
 from typing import Any
@@ -26,7 +26,7 @@ from .db import buffer_size, drain_buffer, postgres_available
 from .ollama_client import OllamaClient
 from .watchers import claude_code as claude_code_watcher
 from .watchers import inbox as inbox_watcher
-from .writers import IngestInput, ingest_document, record_pluto_event
+from .writers import IngestInput, ingest_document
 
 
 def _configure_logging() -> None:
@@ -55,14 +55,6 @@ class DocumentIn(BaseModel):
     turn_count: int | None = None
     tool_call_count: int | None = None
     extra_frontmatter: dict[str, Any] | None = None
-
-
-class PlutoEventIn(BaseModel):
-    ts: datetime | None = None
-    kind: str
-    tool_name: str | None = None
-    parent_session_id: str | None = None
-    payload: dict[str, Any] | None = None
 
 
 # --- App ---------------------------------------------------------------------
@@ -106,11 +98,11 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict:
-        docs, events = buffer_size()
+        docs = buffer_size()
         return {
             "ok": True,
             "postgres_configured": postgres_available(),
-            "buffer": {"documents": docs, "pluto_events": events},
+            "buffer": {"documents": docs},
             "vault": str(settings.vault_path),
         }
 
@@ -126,17 +118,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=str(exc))
         return {"ok": True, "vault_path": str(vault_path)}
 
-    @app.post("/ingest/pluto-event")
-    async def ingest_pluto_event(ev: PlutoEventIn) -> dict:
-        await record_pluto_event(ev.model_dump())
-        return {"ok": True}
-
     @app.post("/admin/drain-buffer")
     async def drain_buffer_endpoint() -> dict:
         if not postgres_available():
             raise HTTPException(status_code=400, detail="Postgres not configured")
-        docs, events = drain_buffer()
-        return {"ok": True, "docs_written": docs, "events_written": events}
+        docs = drain_buffer()
+        return {"ok": True, "docs_written": docs}
 
     @app.post("/admin/reingest/claude-code")
     async def reingest_claude_code(background: bool = True) -> dict:
@@ -180,28 +167,6 @@ def create_app() -> FastAPI:
 
         await _runner()
         return {"ok": True, "files": len(files), "note": "see log for per-file results"}
-
-    @app.post("/admin/pluto/rollup")
-    async def pluto_rollup(target_date: str | None = None) -> dict:
-        """Run Pluto's daily rollup. `target_date` is ISO-8601 (YYYY-MM-DD);
-        defaults to yesterday (UTC). Pulls all pluto_events for that day, asks
-        Gemma E4B to summarize, writes a searchable markdown note into the
-        vault (source='pluto')."""
-        from datetime import date as _date
-        from .pluto_rollup import run_rollup
-
-        parsed: _date | None = None
-        if target_date:
-            try:
-                parsed = _date.fromisoformat(target_date)
-            except ValueError:
-                raise HTTPException(status_code=400,
-                                    detail=f"invalid target_date; use YYYY-MM-DD")
-
-        result = await run_rollup(parsed, ollama)
-        if not result.get("ok"):
-            raise HTTPException(status_code=500, detail=result.get("error", "rollup failed"))
-        return result
 
     @app.post("/admin/reingest/inbox")
     async def reingest_inbox(background: bool = True) -> dict:
