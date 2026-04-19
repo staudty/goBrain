@@ -149,10 +149,63 @@ def _parse_score(text_value: str) -> float:
     return max(0.0, min(100.0, float(m.group(0))))
 
 
+async def _rerank_feasible() -> tuple[bool, str]:
+    """Decide whether running the rerank pass makes sense right now.
+
+    If a model OTHER than the rerank model is currently resident in Ollama —
+    typically gemma4:e4b during active ingestion — each rerank call incurs a
+    full model-swap penalty (20-40s). With 8+ rerank calls per search, that
+    balloons to minutes. Better to fall back to raw ANN top-K.
+
+    Returns (feasible, reason) for logging.
+    """
+    try:
+        async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=5.0) as client:
+            r = await client.get("/api/ps")
+            r.raise_for_status()
+            data = r.json()
+    except Exception as exc:
+        # If we can't tell, be optimistic and try rerank; worst case we wait
+        # a while, but that's still correct behavior.
+        return True, f"ps-check-failed:{type(exc).__name__}"
+
+    loaded = [m.get("name", "") for m in data.get("models", [])]
+    if not loaded:
+        return True, "no-model-loaded"
+    if settings.model_rerank in loaded:
+        return True, "rerank-model-already-loaded"
+    return False, f"other-model-loaded:{loaded[0]}"
+
+
+def _take_top_k_diverse(hits: list[Hit], keep: int) -> list[Hit]:
+    """Same diversity cap as rerank(), applied to raw ANN order."""
+    out: list[Hit] = []
+    per_doc: dict[str, int] = {}
+    for h in hits:
+        if per_doc.get(h.document_id, 0) >= settings.max_chunks_per_document:
+            continue
+        out.append(h)
+        per_doc[h.document_id] = per_doc.get(h.document_id, 0) + 1
+        if len(out) >= keep:
+            break
+    return out
+
+
 async def search(query: str, limit: int, sources: list[str] | None) -> list[Hit]:
     embedding = await embed_query(query)
     candidates = ann_candidates(embedding, settings.search_candidates, sources)
-    return await rerank(query, candidates, limit)
+
+    feasible, reason = await _rerank_feasible()
+    if feasible:
+        log.info("rerank_proceed", reason=reason, candidates=len(candidates))
+        return await rerank(query, candidates, limit)
+    else:
+        # Degrade gracefully: skip the LLM rerank, return raw ANN top-K with
+        # the same diversity cap. Results are usually close to reranked output
+        # for well-formed queries and the user gets an answer in seconds instead
+        # of minutes.
+        log.info("rerank_skipped", reason=reason, candidates=len(candidates))
+        return _take_top_k_diverse(candidates, limit)
 
 
 # --- Secondary tools --------------------------------------------------------
