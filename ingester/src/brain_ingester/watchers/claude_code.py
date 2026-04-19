@@ -104,10 +104,9 @@ def _new_state(path: Path, root: Path) -> SessionState:
         <root>/<project>/<parent-session-uuid>/subagents/agent-<id>.jsonl
         -> project=<project>, session_id=<parent-session-uuid>/subagents/<agent-id>
 
-    Keeping the parent UUID in session_id preserves traceability (you can grep
-    pluto-activity / search_brain and see which parent ran each sub-agent)
-    AND prevents dedup collisions between same-named sub-agents across
-    different parent sessions.
+    Keeping the parent UUID in session_id preserves traceability (you can
+    search and see which parent session ran each sub-agent) AND prevents
+    dedup collisions between same-named sub-agents across different parents.
     """
     rel = path.relative_to(root)
     parts = rel.parts

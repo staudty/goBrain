@@ -13,7 +13,7 @@ else
   log "Ollama already installed: $(ollama --version)"
 fi
 
-# Minimum version for Gemma 4 support (per leopardracer's notes).
+# Minimum version for Gemma 4 support.
 OLLAMA_MIN_VERSION="0.20.0"
 CURRENT_VERSION="$(ollama --version 2>/dev/null | awk '{print $NF}' || echo 0)"
 if ! printf '%s\n%s\n' "$OLLAMA_MIN_VERSION" "$CURRENT_VERSION" | sort -V -C; then
