@@ -12,7 +12,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    postgres_dsn: str = "postgresql+psycopg://brain:CHANGEME@192.168.1.178:5433/brain"
+    postgres_dsn: str = "postgresql+psycopg://brain:CHANGEME@localhost:5432/brain"
     ollama_base_url: str = "http://127.0.0.1:11434"
     model_rerank: str = "gemma4:e2b"
     model_embed: str = "nomic-embed-text"
