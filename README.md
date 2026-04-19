@@ -5,7 +5,9 @@ A self-hosted, local-first **unified second brain** that captures AI conversatio
 Today, conversations you have with Claude (web, desktop, mobile, CLI), Grok, Claude Code terminal sessions, and any autonomous Claude Code agents you run are **siloed** — none of them can reference what happened in the others. goBrain unifies them into one markdown vault + one pgvector index, queryable from wherever you work.
 
 <p align="center">
-  <img alt="goBrain high-level architecture" src="docs/architecture-dark.svg" width="720">
+  <img alt="goBrain dashboard — system health, backfill progress, ingest velocity" src="docs/screenshots/dashboard-hero.png" width="820">
+  <br>
+  <em>The zero-build dashboard served by the ingester at <code>/dashboard</code>.</em>
 </p>
 
 ---
@@ -162,7 +164,11 @@ mv ~/Downloads/<export>.zip <vault>/_inbox/
 http://<ingester-host>:8765/dashboard
 ```
 
-Zero-build HTML/JS dashboard served by the ingester itself — totals per source, 24h ingest velocity, recent documents, SQLite buffer depth. Polls every 5 seconds.
+Zero-build HTML/JS dashboard served by the ingester itself — system health (Postgres, Ollama + currently-loaded model, each watcher task, Windows shipper freshness), backfill progress per source, 24h ingest velocity, recent documents, SQLite buffer depth. Polls every 5 seconds.
+
+<p align="center">
+  <img alt="goBrain dashboard — full page" src="docs/screenshots/dashboard.png" width="720">
+</p>
 
 **Check ingest progress from the command line:**
 ```bash
