@@ -93,10 +93,34 @@ async def run(ollama: OllamaClient, stop: asyncio.Event, root: Path | None = Non
 
 
 def _new_state(path: Path, root: Path) -> SessionState:
+    """Turn a JSONL path into (project, session_id). Handles both flat and
+    nested sub-agent layouts.
+
+    Flat (normal session):
+        <root>/<project>/<session-uuid>.jsonl
+        -> project=<project>, session_id=<session-uuid>
+
+    Nested (sub-agent trace spawned by the Task tool inside a parent session):
+        <root>/<project>/<parent-session-uuid>/subagents/agent-<id>.jsonl
+        -> project=<project>, session_id=<parent-session-uuid>/subagents/<agent-id>
+
+    Keeping the parent UUID in session_id preserves traceability (you can grep
+    pluto-activity / search_brain and see which parent ran each sub-agent)
+    AND prevents dedup collisions between same-named sub-agents across
+    different parent sessions.
+    """
     rel = path.relative_to(root)
     parts = rel.parts
     project = parts[0] if len(parts) > 1 else "unknown"
-    session_id = path.stem
+
+    # Sub-agent: <project>/<parent-uuid>/subagents/agent-<id>.jsonl
+    if len(parts) >= 4 and parts[-2] == "subagents":
+        parent_session_uuid = parts[-3]
+        agent_id = path.stem
+        session_id = f"{parent_session_uuid}/subagents/{agent_id}"
+    else:
+        session_id = path.stem
+
     return SessionState(path=path, project=project, session_id=session_id)
 
 
