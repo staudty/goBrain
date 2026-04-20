@@ -114,7 +114,16 @@ async def ingest_document(inp: IngestInput, ollama: OllamaClient) -> Path:
 
 def _vault_path_for(inp: IngestInput) -> Path:
     date = (inp.started_at or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
-    safe_id = inp.source_id.replace("/", "_").replace(" ", "_")[:60]
+    raw = inp.source_id.replace("/", "_").replace(" ", "_")
+    # Cap at 100 chars of readable prefix, then always append an 8-char
+    # content hash of the FULL source_id. This keeps filenames readable
+    # for humans AND unique for the DB — two sub-agents of the same
+    # parent session share a prefix but always hash differently.
+    # Previously a naive [:60] truncation collided on any source_id
+    # that shared a prefix beyond ~60 chars (classic case: subagents
+    # whose identity lived entirely in the suffix).
+    h = hashlib.sha1(inp.source_id.encode("utf-8")).hexdigest()[:8]
+    safe_id = f"{raw[:100]}_{h}"
     slug = f"{date}_{safe_id}.md"
     if inp.project:
         safe_proj = inp.project.replace("/", "_").replace(" ", "_")
