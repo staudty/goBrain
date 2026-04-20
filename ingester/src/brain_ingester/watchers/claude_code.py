@@ -166,8 +166,15 @@ async def _ingest(state: SessionState, ollama: OllamaClient) -> None:
 def _render_conversation(events: list[dict]) -> tuple[str, int, int, datetime | None, datetime | None, str | None]:
     """Reduce a JSONL event stream to a human-readable markdown transcript.
 
-    Claude Code's schema evolves; this handler is defensive and tolerates
-    unknown event types (they are rendered as a short marker).
+    Claude Code's JSONL has two top-level event kinds we render:
+      type=user       — either a user prompt or a tool result (has toolUseResult)
+      type=assistant  — one or more content blocks (text + tool_use)
+    Everything else (queue-operation, summary pings, etc.) is skipped.
+
+    Content lives at ev["message"]["content"]:
+      - user: plain string (or list for tool results)
+      - assistant: list of blocks like {type:"text", text:"..."} or
+                   {type:"tool_use", name, input}.
     """
     lines: list[str] = []
     turn_count = 0
@@ -182,38 +189,110 @@ def _render_conversation(events: list[dict]) -> tuple[str, int, int, datetime | 
             started_at = started_at or ts
             ended_at = ts
 
-        etype = ev.get("type") or ev.get("role") or ""
-        model = model or ev.get("model")
+        etype = ev.get("type") or ""
+        msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+        model = model or msg.get("model") or ev.get("model")
 
-        if etype in ("user", "human"):
-            turn_count += 1
-            lines.append(f"### User\n\n{_extract_text(ev)}\n")
-        elif etype in ("assistant", "ai"):
-            turn_count += 1
-            lines.append(f"### Assistant\n\n{_extract_text(ev)}\n")
-        elif etype in ("tool_use", "tool_call"):
-            tool_count += 1
-            name = ev.get("name") or ev.get("tool_name") or "tool"
-            payload = ev.get("input") or ev.get("arguments") or {}
-            lines.append(f"**Tool call: `{name}`**\n\n```json\n{json.dumps(payload, indent=2)[:2000]}\n```\n")
-        elif etype in ("tool_result",):
-            result = ev.get("content") or ev.get("result") or ""
-            snippet = (result if isinstance(result, str) else json.dumps(result))[:1500]
-            lines.append(f"**Tool result**\n\n```\n{snippet}\n```\n")
+        if etype == "user":
+            # A user event is either a fresh human prompt or a tool-result
+            # delivery. Tool results carry a toolUseResult sibling field and
+            # their message.content is a list of tool_result blocks.
+            if ev.get("toolUseResult") is not None:
+                rendered = _render_user_tool_result(msg, ev)
+                if rendered:
+                    lines.append(rendered)
+            else:
+                text = _extract_user_text(msg)
+                if text:
+                    turn_count += 1
+                    lines.append(f"### User\n\n{text}\n")
+        elif etype == "assistant":
+            blocks_md, tools_seen = _render_assistant_blocks(msg)
+            if blocks_md:
+                turn_count += 1
+                tool_count += tools_seen
+                lines.append(f"### Assistant\n\n{blocks_md}\n")
         else:
-            continue  # quietly drop unknown event types
+            continue  # queue-operation and friends — skip
 
     return "\n".join(lines), turn_count, tool_count, started_at, ended_at, model
 
 
-def _extract_text(ev: dict) -> str:
-    content = ev.get("content") or ev.get("text") or ""
-    if isinstance(content, list):
-        parts = [c.get("text", "") for c in content if isinstance(c, dict)]
-        return "\n".join(p for p in parts if p)
+def _extract_user_text(msg: dict) -> str:
+    content = msg.get("content")
     if isinstance(content, str):
-        return content
-    return json.dumps(content)
+        return content.strip()
+    if isinstance(content, list):
+        # Some user events use a block list; pluck any text blocks.
+        parts = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                parts.append(c.get("text", ""))
+        return "\n".join(p for p in parts if p).strip()
+    return ""
+
+
+def _render_assistant_blocks(msg: dict) -> tuple[str, int]:
+    """Return (markdown, tool_call_count) for the assistant's content blocks."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content.strip(), 0
+    if not isinstance(content, list):
+        return "", 0
+
+    parts: list[str] = []
+    tools = 0
+    for c in content:
+        if not isinstance(c, dict):
+            continue
+        btype = c.get("type")
+        if btype == "text":
+            text = (c.get("text") or "").strip()
+            if text:
+                parts.append(text)
+        elif btype == "tool_use":
+            tools += 1
+            name = c.get("name") or "tool"
+            payload = c.get("input") or {}
+            payload_str = json.dumps(payload, indent=2)[:2000]
+            parts.append(f"**Tool call: `{name}`**\n\n```json\n{payload_str}\n```")
+        elif btype == "thinking":
+            # Skip — thinking blocks are internal chain-of-thought we don't
+            # want in the vault.
+            continue
+    return "\n\n".join(parts), tools
+
+
+def _render_user_tool_result(msg: dict, ev: dict) -> str:
+    """Render a tool_result event. content is usually a list of blocks
+    like {type:"tool_result", tool_use_id, content:"..."}. Cap size."""
+    content = msg.get("content")
+    snippets: list[str] = []
+    if isinstance(content, list):
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            inner = c.get("content")
+            if isinstance(inner, str):
+                snippets.append(inner)
+            elif isinstance(inner, list):
+                for sub in inner:
+                    if isinstance(sub, dict) and sub.get("type") == "text":
+                        snippets.append(sub.get("text", ""))
+    elif isinstance(content, str):
+        snippets.append(content)
+    else:
+        # Fall back to the sibling toolUseResult field
+        tur = ev.get("toolUseResult")
+        if isinstance(tur, str):
+            snippets.append(tur)
+        elif tur is not None:
+            snippets.append(json.dumps(tur)[:1500])
+
+    body = "\n".join(s for s in snippets if s).strip()
+    if not body:
+        return ""
+    return f"**Tool result**\n\n```\n{body[:1500]}\n```\n"
 
 
 def _parse_ts(value) -> datetime | None:
