@@ -347,27 +347,59 @@ def create_app() -> FastAPI:
         if not postgres_available():
             return {"postgres_configured": False, "sources": []}
 
-        # Claude Code: compare JSONL files on disk to documents in DB.
+        # Claude Code + OpenClaw: compare JSONL files on disk to DB rows.
+        # Claude Code encodes a session's cwd as its project directory name
+        # with slashes replaced by dashes, so `-Users-chris-clawd-puck-engine`
+        # on disk corresponds to cwd `/Users/chris/clawd/puck-engine` — which
+        # makes openclaw-vs-claude-code classification a cheap string test
+        # over the path (no need to re-open each JSONL on every poll).
         cc_dirs = [settings.claude_code_projects_dir, *settings.claude_code_extra_dirs]
-        on_disk = 0
+        openclaw_markers = [f"-{sub}" for sub in settings.openclaw_cwd_subpaths]
+
+        def _is_openclaw_project(project_name: str) -> bool:
+            for marker in openclaw_markers:
+                idx = project_name.find(marker)
+                if idx < 0:
+                    continue
+                tail = project_name[idx + len(marker):]
+                if tail == "" or tail.startswith("-"):
+                    return True
+            return False
+
+        on_disk_cc = 0
+        on_disk_oc = 0
         for d in cc_dirs:
-            if d.exists():
-                on_disk += sum(1 for _ in d.rglob("*.jsonl"))
+            if not d.exists():
+                continue
+            for p in d.rglob("*.jsonl"):
+                rel = p.relative_to(d)
+                project_dir = rel.parts[0] if rel.parts else ""
+                if _is_openclaw_project(project_dir):
+                    on_disk_oc += 1
+                else:
+                    on_disk_cc += 1
+
         with pg_session() as s:
             cc_ingested = s.execute(
                 select(func.count(Document.id)).where(Document.source == "claude-code")
             ).scalar_one()
-        cc = {
-            "source": "claude-code",
-            "ingested": cc_ingested,
-            "total": max(cc_ingested, on_disk),
-            "pending_estimate": max(0, on_disk - cc_ingested),
-        }
-        if cc["total"]:
-            cc["pct"] = round(100 * cc_ingested / cc["total"])
-        else:
-            cc["pct"] = 100
-        out["sources"].append(cc)
+            oc_ingested = s.execute(
+                select(func.count(Document.id)).where(Document.source == "openclaw")
+            ).scalar_one()
+
+        for src, ingested, on_disk in (
+            ("claude-code", cc_ingested, on_disk_cc),
+            ("openclaw", oc_ingested, on_disk_oc),
+        ):
+            total = max(ingested, on_disk)
+            entry = {
+                "source": src,
+                "ingested": ingested,
+                "total": total,
+                "pending_estimate": max(0, on_disk - ingested),
+                "pct": round(100 * ingested / total) if total else 100,
+            }
+            out["sources"].append(entry)
 
         # Inbox (Grok + Claude.ai exports + ad-hoc files):
         # count files still in _inbox/ vs files already in _processed/.
