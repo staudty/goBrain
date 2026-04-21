@@ -49,7 +49,7 @@ async def list_tools() -> list[Tool]:
                     "sources": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Filter by source: claude-code, claude-desktop, claude-ai, grok, inbox."
+                        "description": "Filter by source: claude-code, openclaw, claude-desktop, claude-ai, grok, inbox."
                     },
                 },
                 "required": ["query"],

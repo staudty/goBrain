@@ -144,14 +144,16 @@ async def _ingest(state: SessionState, ollama: OllamaClient) -> None:
 
     body, turn_count, tool_count, started_at, ended_at, model = _render_conversation(events)
 
+    source, project = _classify(events, state.project)
+
     await ingest_document(
         IngestInput(
-            source="claude-code",
+            source=source,
             source_id=f"{state.project}/{state.session_id}",
             conversation_text=body,
             started_at=started_at,
             ended_at=ended_at,
-            project=state.project,
+            project=project,
             model=model,
             turn_count=turn_count,
             tool_call_count=tool_count,
@@ -159,8 +161,46 @@ async def _ingest(state: SessionState, ollama: OllamaClient) -> None:
         ollama,
     )
     log.info("claude_code_ingested",
-             project=state.project, session=state.session_id,
+             source=source, project=project, session=state.session_id,
              turns=turn_count, tools=tool_count)
+
+
+def _classify(events: list[dict], fallback_project: str) -> tuple[str, str]:
+    """Decide whether this session is plain Claude Code or an OpenClaw
+    (agent-driven) session, and produce a clean project name.
+
+    OpenClaw sessions are Claude Code sessions whose cwd lives under one
+    of `settings.openclaw_cwd_subpaths` (default: ~/clawd). Their project
+    name is derived from the cwd tail rather than the Claude-Code-encoded
+    directory name (e.g. cwd=/Users/<you>/clawd/puck-engine → project=
+    "puck-engine"; bare cwd=/Users/<you>/clawd → project="clawd").
+    """
+    from pathlib import Path as _P
+    home = _P.home()
+    openclaw_prefixes = [
+        str((home / sub).resolve()) for sub in settings.openclaw_cwd_subpaths
+    ]
+
+    cwd = next((ev.get("cwd") for ev in events if ev.get("cwd")), None)
+    if not cwd:
+        return "claude-code", fallback_project
+
+    try:
+        cwd_resolved = str(_P(cwd).resolve())
+    except (OSError, RuntimeError):
+        cwd_resolved = cwd
+
+    for prefix in openclaw_prefixes:
+        if cwd_resolved == prefix or cwd_resolved.startswith(prefix + "/"):
+            try:
+                rel = _P(cwd_resolved).relative_to(prefix)
+                rel_str = str(rel).strip("./")
+            except ValueError:
+                rel_str = ""
+            project = rel_str.replace("/", "_") if rel_str else _P(prefix).name
+            return "openclaw", project
+
+    return "claude-code", fallback_project
 
 
 def _render_conversation(events: list[dict]) -> tuple[str, int, int, datetime | None, datetime | None, str | None]:

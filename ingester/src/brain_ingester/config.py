@@ -67,5 +67,13 @@ class Settings(BaseSettings):
     # or JSON list).
     grok_companion_names: list[str] = ["Ani", "Mika", "Valentine", "Rudi"]
 
+    # Claude Code sessions whose cwd starts with one of these paths (relative
+    # to $HOME) get tagged source=openclaw instead of source=claude-code.
+    # Useful for distinguishing interactive Claude Code sessions from
+    # autonomous agent activity driven by OpenClaw (or similar wrappers)
+    # that happens to run on top of the same Claude Code JSONL schema.
+    # Default ~/clawd matches the standard OpenClaw install directory.
+    openclaw_cwd_subpaths: list[str] = ["clawd"]
+
 
 settings = Settings()

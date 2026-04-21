@@ -32,7 +32,7 @@ Each session note starts with YAML frontmatter used by both humans and the inges
 
 ```yaml
 ---
-source: claude-code      # claude-code | claude-desktop | claude-ai | grok | inbox
+source: claude-code      # claude-code | openclaw | claude-desktop | claude-ai | grok | inbox
 source_id: <stable id>   # for dedup on re-ingestion
 project: my-project      # optional context tag
 started_at: 2026-04-18T14:03:12-04:00
