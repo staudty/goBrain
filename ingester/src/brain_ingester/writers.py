@@ -46,6 +46,18 @@ async def ingest_document(inp: IngestInput, ollama: OllamaClient) -> Path:
     """
     raw_hash = hashlib.sha256(inp.conversation_text.encode("utf-8")).hexdigest()
 
+    # 0. Fast-path dedup: if an identical row already exists, skip the
+    # expensive summarize + embed pipeline. Matters enormously on reingest
+    # runs over a populated corpus — without this, every already-ingested
+    # file still burns ~1-2min on an Ollama summarize call that gets
+    # thrown away because the raw_hash matched.
+    if postgres_available() and _already_ingested(inp.source, inp.source_id, raw_hash):
+        log.info(
+            "skipped_duplicate_fast",
+            source=inp.source, source_id=inp.source_id,
+        )
+        return _vault_path_for(inp)
+
     # 1. Summarize
     summary = await summarize_conversation(ollama, inp.conversation_text)
 
@@ -110,6 +122,24 @@ async def ingest_document(inp: IngestInput, ollama: OllamaClient) -> Path:
                  buffer_reason="postgres_unavailable")
 
     return vault_path
+
+
+def _already_ingested(source: str, source_id: str, raw_hash: str) -> bool:
+    """Cheap lookup: does this (source, source_id) already exist with the
+    same raw_hash? If so, we can skip summarize + embed entirely."""
+    try:
+        with pg_session() as session:
+            existing = session.execute(
+                select(Document.raw_hash).where(
+                    Document.source == source,
+                    Document.source_id == source_id,
+                )
+            ).scalar_one_or_none()
+        return existing == raw_hash
+    except Exception:
+        # If the DB isn't reachable we'd rather proceed and let the later
+        # write fall through to the SQLite buffer path than fail fast here.
+        return False
 
 
 def _vault_path_for(inp: IngestInput) -> Path:
