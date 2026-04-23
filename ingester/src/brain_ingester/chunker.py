@@ -24,7 +24,12 @@ def chunk_text(text: str) -> list[Chunk]:
     target = settings.chunk_target_tokens
     overlap = settings.chunk_overlap_tokens
 
-    tokens = _enc.encode(text)
+    # disallowed_special=() so literal strings like "<|endoftext|>" in the
+    # source text are encoded as plain bytes instead of raising ValueError.
+    # Goes wrong whenever a user (or our own diagnostics) types a tiktoken
+    # sentinel verbatim — we'd rather embed it as regular content than
+    # refuse to index the whole document.
+    tokens = _enc.encode(text, disallowed_special=())
     if len(tokens) <= target:
         return [Chunk(index=0, content=text)]
 

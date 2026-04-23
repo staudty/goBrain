@@ -5,6 +5,7 @@ and re-embeds chunks; otherwise skips.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import uuid
 from dataclasses import dataclass
@@ -44,6 +45,19 @@ async def ingest_document(inp: IngestInput, ollama: OllamaClient) -> Path:
 
     Returns the vault path of the written note.
     """
+    # Strip NUL bytes up front. Postgres `text` columns reject 0x00, and
+    # tool-result blocks occasionally carry binary payloads (screenshots,
+    # piped binary stdout, etc.). Replace with U+FFFD so the rendered body
+    # still reads sensibly but persists.
+    if "\x00" in inp.conversation_text:
+        cleaned = inp.conversation_text.replace("\x00", "\ufffd")
+        inp = dataclasses.replace(inp, conversation_text=cleaned)
+        log.info(
+            "stripped_nul_bytes",
+            source=inp.source, source_id=inp.source_id,
+            original_len=len(cleaned),
+        )
+
     raw_hash = hashlib.sha256(inp.conversation_text.encode("utf-8")).hexdigest()
 
     # 0. Fast-path dedup: if an identical row already exists, skip the
@@ -88,10 +102,26 @@ async def ingest_document(inp: IngestInput, ollama: OllamaClient) -> Path:
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     abs_path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
-    # 4. Chunk + embed
+    # 4. Chunk + embed. Batch the embed call — Ollama can theoretically
+    # accept one big batch, but a single ~7000-chunk request from a huge
+    # session has blown the 600s read timeout in practice. 256 chunks per
+    # request keeps each request well under timeout and still amortizes
+    # the model-load cost.
     chunks = chunk_text(inp.conversation_text)
     chunk_contents = [c.content for c in chunks]
-    embeddings = await ollama.embed(settings.model_embed, chunk_contents) if chunks else []
+    embeddings: list[list[float]] = []
+    if chunks:
+        EMBED_BATCH = 256
+        for start in range(0, len(chunk_contents), EMBED_BATCH):
+            batch = chunk_contents[start : start + EMBED_BATCH]
+            batch_embeddings = await ollama.embed(settings.model_embed, batch)
+            embeddings.extend(batch_embeddings)
+        if len(chunks) > EMBED_BATCH:
+            log.info(
+                "embedded_batched",
+                source=inp.source, source_id=inp.source_id,
+                chunks=len(chunks), batches=(len(chunks) + EMBED_BATCH - 1) // EMBED_BATCH,
+            )
 
     # 5. Persist
     document_payload = {
