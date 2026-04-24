@@ -40,6 +40,19 @@ from .writers import IngestInput, ingest_document
 _DASHBOARD_HTML = Path(__file__).parent / "dashboard.html"
 
 
+def _pct(ingested: int, total: int) -> int:
+    """Progress percentage that's honest near the boundaries.
+
+    round() rolls 99.5+ to 100, which made bars show "100%" while
+    1 item was still pending. Cap at 99 unless we're actually done.
+    """
+    if total <= 0:
+        return 100
+    if ingested >= total:
+        return 100
+    return min(99, round(100 * ingested / total))
+
+
 def _count_grok_conversations(zip_path: Path) -> int | None:
     """Return number of conversations inside a Grok export zip, or None if
     it isn't a Grok zip or can't be read."""
@@ -397,7 +410,7 @@ def create_app() -> FastAPI:
                 "ingested": ingested,
                 "total": total,
                 "pending_estimate": max(0, on_disk - ingested),
-                "pct": round(100 * ingested / total) if total else 100,
+                "pct": _pct(ingested, total),
             }
             out["sources"].append(entry)
 
@@ -457,7 +470,7 @@ def create_app() -> FastAPI:
         }
         grok_total = grok_ingested + pending_grok
         grok["total"] = grok_total
-        grok["pct"] = round(100 * grok_ingested / grok_total) if grok_total else 100
+        grok["pct"] = _pct(grok_ingested, grok_total)
         out["sources"].append(grok)
 
         claude_ai = {
@@ -468,7 +481,7 @@ def create_app() -> FastAPI:
         }
         ca_total = claude_ai_ingested + pending_claude_ai
         claude_ai["total"] = ca_total
-        claude_ai["pct"] = round(100 * claude_ai_ingested / ca_total) if ca_total else 100
+        claude_ai["pct"] = _pct(claude_ai_ingested, ca_total)
         out["sources"].append(claude_ai)
 
         return out

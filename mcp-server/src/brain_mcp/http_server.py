@@ -14,27 +14,33 @@ Auth, per MCP spec (2025-06-18+):
         /.well-known/oauth-authorization-server (RFC 8414)
         /.well-known/oauth-protected-resource   (RFC 9728, referenced by
                                                  WWW-Authenticate on 401s)
-  - Issues access tokens at POST /token via the client_credentials grant,
-    authenticated by a pre-shared (client_id, client_secret) pair from .env.
-    Supports both client_secret_post (form body) and client_secret_basic
-    (HTTP Basic) auth methods.
+  - Implements both OAuth 2.0 grant types MCP clients use in the wild:
+        * authorization_code + PKCE (what Claude iOS / web / Desktop use)
+        * client_credentials        (handy for automation / curl tests)
 
 Anthropic's Custom Connector UI asks for an OAuth Client ID + Client Secret.
-Paste the values from .env into those fields on claude.ai and Claude takes
-care of the token dance per the MCP spec on every invocation.
+Paste the values from .env into those fields on claude.ai; Claude handles
+the rest of the OAuth dance on every invocation.
+
+Single-user server: /authorize does not render a consent screen — it
+immediately issues a code and redirects back. The redirect_uri allowlist
+in settings.oauth_allowed_redirect_uris prevents someone tricking your
+browser into leaking a code to a third-party target; PKCE prevents code
+reuse if one ever does leak.
 
 For local curl testing there is an optional BRAIN_MCP_REMOTE_BEARER_TOKEN
-static token that bypasses OAuth. Treat it as an admin credential; prefer
-OAuth for anything long-lived.
+static token that bypasses OAuth entirely. Treat it as an admin credential.
 """
 from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import logging
 import secrets
 import time
 from typing import Iterable
+from urllib.parse import urlencode
 
 import structlog
 import uvicorn
@@ -43,7 +49,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
 
 from .config import settings
@@ -54,13 +60,13 @@ log = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# In-memory access-token store
+# In-memory access-token + authorization-code stores
 #
-# A restart invalidates all outstanding tokens; MCP clients (Claude iOS,
-# etc.) simply re-run client_credentials on the next call and carry on. No
-# user session is lost because the tokens were machine-issued anyway.
+# A restart invalidates both; MCP clients re-run the grant on the next call
+# and carry on. No persistent user session to lose.
 # ---------------------------------------------------------------------------
 _issued_tokens: dict[str, float] = {}  # access_token → unix expiry
+_issued_codes: dict[str, dict] = {}    # authorization_code → {..., "expires_at": float}
 
 
 def _issue_token() -> tuple[str, int]:
@@ -75,10 +81,42 @@ def _validate_issued_token(token: str) -> bool:
     if expiry is None:
         return False
     if time.time() >= expiry:
-        # Expired — clean up
         _issued_tokens.pop(token, None)
         return False
     return True
+
+
+def _issue_code(*, client_id: str, redirect_uri: str,
+                code_challenge: str, code_challenge_method: str,
+                scope: str) -> str:
+    code = secrets.token_urlsafe(32)
+    _issued_codes[code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "scope": scope,
+        "expires_at": time.time() + settings.oauth_code_ttl_seconds,
+    }
+    return code
+
+
+def _consume_code(code: str) -> dict | None:
+    """Pop-and-validate an authorization_code. One-time use by design."""
+    entry = _issued_codes.pop(code, None)
+    if entry is None:
+        return None
+    if time.time() >= entry["expires_at"]:
+        return None
+    return entry
+
+
+def _verify_pkce(code_verifier: str, expected_challenge: str, method: str) -> bool:
+    if method != "S256":
+        return False
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return secrets.compare_digest(computed, expected_challenge)
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +127,7 @@ def _public_base_url(request: Request) -> str:
 
     Behind Cloudflare Tunnel / Caddy / nginx the server sees an inbound
     http:// connection on loopback, not the public https:// URL. Prefer the
-    forwarded headers so discovery URLs point at the same origin Claude
+    forwarded headers so discovery URLs point at the same origin the client
     hit (brain.gobag.dev), not at 127.0.0.1.
     """
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
@@ -124,23 +162,22 @@ class McpPathNormalizeMiddleware:
 # ---------------------------------------------------------------------------
 # Auth middleware
 # ---------------------------------------------------------------------------
-# Paths that bypass auth (discovery + health + token itself).
 _PUBLIC_PATHS: frozenset[str] = frozenset({
     "/health",
     "/token",
+    "/authorize",
     "/.well-known/oauth-authorization-server",
     "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/mcp",  # Claude probes this variant too
 })
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Protect /mcp (and any other non-public path) with Bearer auth.
+    """Protect /mcp (and any non-public path) with Bearer auth.
 
-    Accepts two token varieties:
-      - a token issued by our own /token endpoint (the usual path for
-        Claude iOS / web / Desktop via OAuth client_credentials)
-      - optionally, a static dev-bypass token from settings.remote_bearer_token
-        for curl testing
+    Accepts either a token issued by our own /token endpoint (the normal
+    path for Claude iOS / web / Desktop via OAuth) or, optionally, a static
+    dev-bypass token from settings.remote_bearer_token for curl testing.
     """
 
     def __init__(self, app, static_token: str | None) -> None:
@@ -158,11 +195,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
         provided = header.split(" ", 1)[1].strip()
 
-        # Dev-bypass static token (optional)
         if self._static_token and secrets.compare_digest(provided, self._static_token):
             return await call_next(request)
 
-        # OAuth-issued token
         if _validate_issued_token(provided):
             return await call_next(request)
 
@@ -170,8 +205,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                                description="token is not recognized or has expired")
 
     def _challenge(self, request: Request, *, error: str, description: str) -> Response:
-        """Return a 401 with the WWW-Authenticate header MCP clients use to
-        discover the OAuth protected-resource metadata (RFC 9728)."""
+        """Return 401 with the WWW-Authenticate header MCP clients follow
+        to discover the OAuth protected-resource metadata (RFC 9728)."""
         base = _public_base_url(request)
         resource_metadata = f"{base}/.well-known/oauth-protected-resource"
         resp = JSONResponse(
@@ -199,20 +234,25 @@ async def _oauth_authorization_server(request: Request) -> JSONResponse:
     base = _public_base_url(request)
     return JSONResponse({
         "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
         "token_endpoint": f"{base}/token",
         "token_endpoint_auth_methods_supported": [
             "client_secret_post",
             "client_secret_basic",
+            "none",  # public clients using PKCE
         ],
-        "grant_types_supported": ["client_credentials"],
-        "response_types_supported": ["token"],
+        "grant_types_supported": [
+            "authorization_code",
+            "client_credentials",
+        ],
+        "response_types_supported": ["code"],
+        "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["mcp"],
     })
 
 
 async def _oauth_protected_resource(request: Request) -> JSONResponse:
-    """RFC 9728 Protected Resource Metadata — points MCP clients at our
-    authorization server (which happens to be this same origin)."""
+    """RFC 9728 Protected Resource Metadata."""
     base = _public_base_url(request)
     return JSONResponse({
         "resource": base,
@@ -222,13 +262,85 @@ async def _oauth_protected_resource(request: Request) -> JSONResponse:
     })
 
 
+def _error_redirect(redirect_uri: str, error: str, state: str | None,
+                    description: str | None = None) -> RedirectResponse:
+    """Build a spec-compliant error redirect back to the client."""
+    params = {"error": error}
+    if description:
+        params["error_description"] = description
+    if state:
+        params["state"] = state
+    sep = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(f"{redirect_uri}{sep}{urlencode(params)}", status_code=302)
+
+
+async def _authorize_endpoint(request: Request) -> Response:
+    """OAuth 2.0 authorization endpoint — authorization_code grant + PKCE.
+
+    Single-user server: no consent screen. We validate client_id,
+    redirect_uri, and PKCE parameters; on success we issue an auth code
+    and redirect straight back to the client's callback.
+    """
+    params = request.query_params
+    response_type = params.get("response_type")
+    client_id = params.get("client_id") or ""
+    redirect_uri = params.get("redirect_uri") or ""
+    code_challenge = params.get("code_challenge") or ""
+    code_challenge_method = params.get("code_challenge_method") or "plain"
+    state = params.get("state")
+    scope = params.get("scope", "mcp")
+
+    # Validate redirect_uri FIRST — don't redirect errors to an unvalidated URI.
+    if redirect_uri not in settings.oauth_allowed_redirect_uris:
+        log.warning("authorize_redirect_uri_rejected", got=redirect_uri)
+        return JSONResponse(
+            {"error": "invalid_request",
+             "error_description": f"redirect_uri not in server allowlist: {redirect_uri}"},
+            status_code=400,
+        )
+
+    # Validate client_id similarly — direct 400, don't leak to redirect target.
+    expected_id = settings.oauth_client_id or ""
+    if not expected_id or not secrets.compare_digest(client_id, expected_id):
+        log.warning("authorize_invalid_client_id", got_len=len(client_id))
+        return JSONResponse(
+            {"error": "invalid_client",
+             "error_description": "unknown client_id"},
+            status_code=400,
+        )
+
+    # Beyond here, errors are safe to redirect back (client_id + redirect_uri are OK).
+    if response_type != "code":
+        return _error_redirect(redirect_uri, "unsupported_response_type", state)
+
+    if not code_challenge or code_challenge_method != "S256":
+        return _error_redirect(
+            redirect_uri, "invalid_request", state,
+            "PKCE with code_challenge_method=S256 is required",
+        )
+
+    code = _issue_code(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        scope=scope,
+    )
+    log.info("oauth_code_issued", scope=scope, redirect_uri=redirect_uri)
+
+    callback_params = {"code": code}
+    if state:
+        callback_params["state"] = state
+    sep = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(
+        f"{redirect_uri}{sep}{urlencode(callback_params)}",
+        status_code=302,
+    )
+
+
 def _extract_client_credentials(
     form: Iterable, auth_header: str
 ) -> tuple[str | None, str | None]:
-    """Read client_id + client_secret from either:
-      - POST form body (client_secret_post), or
-      - HTTP Basic auth header (client_secret_basic).
-    """
     form = dict(form)
     client_id = form.get("client_id")
     client_secret = form.get("client_secret")
@@ -239,14 +351,17 @@ def _extract_client_credentials(
             cid, _, csec = decoded.partition(":")
             client_id = client_id or cid
             client_secret = client_secret or csec
-        except Exception:  # malformed header, ignore
+        except Exception:
             pass
 
     return client_id, client_secret
 
 
 async def _token_endpoint(request: Request) -> JSONResponse:
-    """OAuth 2.0 token endpoint — implements the client_credentials grant."""
+    """OAuth 2.0 token endpoint. Supports:
+      - grant_type=authorization_code + code + redirect_uri + code_verifier
+      - grant_type=client_credentials + client_id + client_secret
+    """
     if not (settings.oauth_client_id and settings.oauth_client_secret):
         return JSONResponse(
             {"error": "server_error",
@@ -258,43 +373,102 @@ async def _token_endpoint(request: Request) -> JSONResponse:
         form = await request.form()
     except Exception:
         form = {}
-
-    grant_type = form.get("grant_type")
-    if grant_type != "client_credentials":
-        return JSONResponse(
-            {"error": "unsupported_grant_type",
-             "error_description": "only client_credentials is supported"},
-            status_code=400,
-        )
-
+    form_dict = dict(form)
     auth_header = request.headers.get("authorization", "")
-    client_id, client_secret = _extract_client_credentials(form, auth_header)
+    grant_type = form_dict.get("grant_type")
 
-    if not client_id or not client_secret:
-        return JSONResponse(
-            {"error": "invalid_request",
-             "error_description": "client_id and client_secret required"},
-            status_code=400,
-        )
+    # ---- authorization_code grant -----------------------------------------
+    if grant_type == "authorization_code":
+        code = form_dict.get("code")
+        redirect_uri = form_dict.get("redirect_uri")
+        code_verifier = form_dict.get("code_verifier")
+        client_id, client_secret = _extract_client_credentials(form_dict, auth_header)
 
-    id_ok = secrets.compare_digest(client_id, settings.oauth_client_id)
-    secret_ok = secrets.compare_digest(client_secret, settings.oauth_client_secret)
-    if not (id_ok and secret_ok):
-        log.warning("oauth_invalid_client", client_id_len=len(client_id))
-        return JSONResponse(
-            {"error": "invalid_client",
-             "error_description": "unknown client or bad secret"},
-            status_code=401,
-        )
+        if not (code and redirect_uri and code_verifier and client_id):
+            return JSONResponse(
+                {"error": "invalid_request",
+                 "error_description": "code, redirect_uri, code_verifier, client_id required"},
+                status_code=400,
+            )
 
-    token, ttl = _issue_token()
-    log.info("oauth_token_issued", ttl_seconds=ttl, client_id=client_id)
-    return JSONResponse({
-        "access_token": token,
-        "token_type": "Bearer",
-        "expires_in": ttl,
-        "scope": "mcp",
-    })
+        entry = _consume_code(code)
+        if entry is None:
+            return JSONResponse(
+                {"error": "invalid_grant",
+                 "error_description": "code is unknown, expired, or already used"},
+                status_code=400,
+            )
+        if entry["client_id"] != client_id:
+            return JSONResponse(
+                {"error": "invalid_grant",
+                 "error_description": "code was issued to a different client"},
+                status_code=400,
+            )
+        if entry["redirect_uri"] != redirect_uri:
+            return JSONResponse(
+                {"error": "invalid_grant",
+                 "error_description": "redirect_uri does not match the /authorize request"},
+                status_code=400,
+            )
+        if not _verify_pkce(code_verifier, entry["code_challenge"],
+                            entry["code_challenge_method"]):
+            return JSONResponse(
+                {"error": "invalid_grant",
+                 "error_description": "PKCE verification failed"},
+                status_code=400,
+            )
+        # Confidential client: if a secret is supplied, it must match.
+        if client_secret and not secrets.compare_digest(
+            client_secret, settings.oauth_client_secret or ""
+        ):
+            return JSONResponse(
+                {"error": "invalid_client",
+                 "error_description": "bad client_secret"},
+                status_code=401,
+            )
+
+        token, ttl = _issue_token()
+        log.info("oauth_token_issued", grant="authorization_code",
+                 ttl_seconds=ttl, scope=entry.get("scope"))
+        return JSONResponse({
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": ttl,
+            "scope": entry.get("scope", "mcp"),
+        })
+
+    # ---- client_credentials grant -----------------------------------------
+    if grant_type == "client_credentials":
+        client_id, client_secret = _extract_client_credentials(form_dict, auth_header)
+        if not client_id or not client_secret:
+            return JSONResponse(
+                {"error": "invalid_request",
+                 "error_description": "client_id and client_secret required"},
+                status_code=400,
+            )
+        id_ok = secrets.compare_digest(client_id, settings.oauth_client_id or "")
+        secret_ok = secrets.compare_digest(client_secret, settings.oauth_client_secret or "")
+        if not (id_ok and secret_ok):
+            log.warning("oauth_invalid_client", client_id_len=len(client_id))
+            return JSONResponse(
+                {"error": "invalid_client",
+                 "error_description": "unknown client or bad secret"},
+                status_code=401,
+            )
+        token, ttl = _issue_token()
+        log.info("oauth_token_issued", grant="client_credentials", ttl_seconds=ttl)
+        return JSONResponse({
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": ttl,
+            "scope": "mcp",
+        })
+
+    return JSONResponse(
+        {"error": "unsupported_grant_type",
+         "error_description": "only authorization_code and client_credentials are supported"},
+        status_code=400,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +489,6 @@ def _build_app() -> Starlette:
                  "connectors require OAuth",
         )
 
-    # Stateless=True keeps each request self-contained (no server-side
-    # session state to lose on restart). Fine for our small, read-only
-    # tool set; revisit if we add long-running streams.
     session_manager = StreamableHTTPSessionManager(app=mcp_app, stateless=True)
 
     async def mcp_endpoint(scope, receive, send):
@@ -340,6 +511,10 @@ def _build_app() -> Starlette:
                   _oauth_authorization_server, methods=["GET"]),
             Route("/.well-known/oauth-protected-resource",
                   _oauth_protected_resource, methods=["GET"]),
+            # Some clients probe an /mcp-scoped variant of the resource metadata.
+            Route("/.well-known/oauth-protected-resource/mcp",
+                  _oauth_protected_resource, methods=["GET"]),
+            Route("/authorize", _authorize_endpoint, methods=["GET"]),
             Route("/token", _token_endpoint, methods=["POST"]),
             Mount("/mcp", app=mcp_endpoint),
         ],
@@ -348,17 +523,14 @@ def _build_app() -> Starlette:
         ],
         lifespan=lifespan,
     )
-    # Streamable HTTP clients POST to exactly /mcp. Default Starlette
-    # routing 307-redirects that to /mcp/, which curl -X POST won't follow
-    # and Claude iOS won't honor either. Turn it off on the router directly
-    # (the Starlette constructor didn't accept this kwarg until ~0.38).
+    # Streamable HTTP clients POST to exactly /mcp. Default Starlette routing
+    # 307-redirects that to /mcp/, which curl -X POST won't follow and Claude
+    # iOS won't honor either.
     starlette_app.router.redirect_slashes = False
     return starlette_app
 
 
 def run() -> None:
-    # Wrap the Starlette app in the path-normalizer so '/mcp' and '/mcp/'
-    # both land on the Streamable HTTP session manager.
     asgi_app = McpPathNormalizeMiddleware(_build_app())
     uvicorn.run(
         asgi_app,

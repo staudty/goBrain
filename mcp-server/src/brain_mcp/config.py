@@ -39,12 +39,21 @@ class Settings(BaseSettings):
     # clients (Claude iOS, etc.) use the OAuth credentials below instead.
     remote_bearer_token: str | None = None
 
-    # OAuth 2.0 client_credentials grant, per MCP spec. Anthropic's Custom
-    # Connector UI asks for these. Generate with `openssl rand -hex 32` for
-    # each. Paste the pair into claude.ai's OAuth Client ID + Secret fields.
+    # OAuth 2.0, per MCP spec. Anthropic's Custom Connector UI asks for a
+    # client_id and client_secret. Generate each with `openssl rand -hex 32`.
+    # Paste the pair into claude.ai's OAuth Client ID + Secret fields.
     oauth_client_id: str | None = None
     oauth_client_secret: str | None = None
-    oauth_token_ttl_seconds: int = 3600  # 1h, refreshed automatically by clients
+    oauth_token_ttl_seconds: int = 3600   # 1h, refreshed automatically
+    oauth_code_ttl_seconds: int = 60      # short-lived authorization_code
+
+    # redirect_uri allowlist for the authorization_code flow. Claude iOS +
+    # web both post-back to claude.ai/api/mcp/auth_callback. Narrow list =
+    # defence against someone coaxing your browser to hit /authorize with
+    # a malicious redirect target.
+    oauth_allowed_redirect_uris: list[str] = [
+        "https://claude.ai/api/mcp/auth_callback",
+    ]
 
 
 settings = Settings()
