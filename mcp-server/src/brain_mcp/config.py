@@ -33,7 +33,18 @@ class Settings(BaseSettings):
     # touch these.
     http_host: str = "127.0.0.1"         # bind-host; keep loopback behind TLS proxy
     http_port: int = 8766
-    remote_bearer_token: str | None = None  # required by http_server.py to start
+
+    # Static dev-bypass token for local curl testing. Optional, but if set
+    # it grants full access — treat as admin credential. For real remote
+    # clients (Claude iOS, etc.) use the OAuth credentials below instead.
+    remote_bearer_token: str | None = None
+
+    # OAuth 2.0 client_credentials grant, per MCP spec. Anthropic's Custom
+    # Connector UI asks for these. Generate with `openssl rand -hex 32` for
+    # each. Paste the pair into claude.ai's OAuth Client ID + Secret fields.
+    oauth_client_id: str | None = None
+    oauth_client_secret: str | None = None
+    oauth_token_ttl_seconds: int = 3600  # 1h, refreshed automatically by clients
 
 
 settings = Settings()

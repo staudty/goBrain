@@ -26,21 +26,33 @@ server (`server.py`). Both transports share one source of truth.
 
 ## 1. Configure
 
+`brain-mcp-http` speaks MCP's OAuth 2.0 auth flow out of the box — the
+same one Anthropic's Custom Connector UI expects. Claude presents a
+pre-shared `client_id` + `client_secret`, this server's `/token`
+endpoint validates the pair and issues a short-lived Bearer access
+token, Claude uses that token on `/mcp` calls.
+
 On the always-on host (the one that runs the ingester), in
 `mcp-server/.env`:
 
 ```bash
 # Existing settings stay as-is (Postgres DSN, Ollama URL, etc.)
 
-# New ones:
 BRAIN_MCP_HTTP_HOST=127.0.0.1
 BRAIN_MCP_HTTP_PORT=8766
-BRAIN_MCP_REMOTE_BEARER_TOKEN=<generate with: openssl rand -hex 32>
+
+# OAuth 2.0 client_credentials — paste these into Claude's "OAuth
+# Client ID" and "OAuth Client Secret" fields when adding the connector.
+# Generate each with: openssl rand -hex 32
+BRAIN_MCP_OAUTH_CLIENT_ID=<generate>
+BRAIN_MCP_OAUTH_CLIENT_SECRET=<generate>
+
+# Optional: a static bypass token just for curl testing.
+BRAIN_MCP_REMOTE_BEARER_TOKEN=<optional>
 ```
 
-The token is what Claude iOS will present as `Authorization: Bearer <token>`.
-Keep it out of anywhere public. `http_server.py` refuses to start if this
-value is empty — no accidental unauthenticated endpoints.
+`http_server.py` refuses to start if neither OAuth credentials nor a
+static bearer token is set, so the endpoint is never accidentally open.
 
 ## 2. Install as a LaunchAgent (macOS)
 
@@ -151,13 +163,27 @@ Access both gate the endpoint.
 From anywhere (your phone on cellular is the real test):
 
 ```bash
+# health
 curl https://brain.your-domain.tld/health
-# {"ok": true}
+# {"ok":true}
 
-curl -H "Authorization: Bearer WRONG" https://brain.your-domain.tld/mcp
-# {"error":"invalid token"}
+# unauthenticated /mcp returns a challenge pointing at OAuth metadata
+curl -i -X POST https://brain.your-domain.tld/mcp
+# HTTP/1.1 401 Unauthorized
+# www-authenticate: Bearer realm="goBrain", error="invalid_request", ... resource_metadata="https://brain.your-domain.tld/.well-known/oauth-protected-resource"
 
-curl -H "Authorization: Bearer $BRAIN_MCP_REMOTE_BEARER_TOKEN" \
+# OAuth discovery
+curl https://brain.your-domain.tld/.well-known/oauth-protected-resource
+curl https://brain.your-domain.tld/.well-known/oauth-authorization-server
+
+# client_credentials grant
+curl -X POST https://brain.your-domain.tld/token \
+     -d "grant_type=client_credentials&client_id=$BRAIN_MCP_OAUTH_CLIENT_ID&client_secret=$BRAIN_MCP_OAUTH_CLIENT_SECRET"
+# {"access_token":"…","token_type":"Bearer","expires_in":3600,"scope":"mcp"}
+
+# tools/list with the issued token
+TOKEN=<copy access_token from above>
+curl -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" \
      -H "Accept: application/json, text/event-stream" \
      -X POST https://brain.your-domain.tld/mcp \
@@ -165,19 +191,27 @@ curl -H "Authorization: Bearer $BRAIN_MCP_REMOTE_BEARER_TOKEN" \
 # Streamable HTTP initialization + list of tools
 ```
 
-If all three succeed, the server is publicly reachable and auth is working.
+If all of those succeed, the server is publicly reachable and OAuth is working.
 
-## 5. Register as a connector in Claude iOS
+## 5. Register as a connector in Claude
 
-1. Open the Claude iOS app.
-2. Settings → Connectors → **Add custom connector**.
-3. URL: `https://brain.your-domain.tld/mcp`
-4. Name: anything you like (e.g. "My second brain").
-5. Auth: choose **Bearer token** / **API key** and paste the token value.
-6. Save — it'll probe the endpoint, list the tools, and ask which to enable.
+The one-time setup is on **claude.ai (web)** because the iOS app doesn't
+expose the custom-connector add flow in most versions. Once registered
+against your Claude account, the connector shows up automatically on
+iOS, Desktop, and the web UI.
 
-Same flow works on Claude.ai web (Settings → Integrations → Custom
-integrations) and Claude Desktop's connectors UI.
+1. Open claude.ai → profile menu → **Settings → Connectors**.
+2. Click **Add custom connector**.
+3. Name: `goBrain` (or anything).
+4. Remote MCP server URL: `https://brain.your-domain.tld/mcp`
+5. Expand **Advanced settings** and paste:
+   - **OAuth Client ID:** `$BRAIN_MCP_OAUTH_CLIENT_ID`
+   - **OAuth Client Secret:** `$BRAIN_MCP_OAUTH_CLIENT_SECRET`
+6. Click **Add**.
+
+Claude probes the OAuth discovery URL, exchanges the credentials at
+`/token`, fetches `tools/list`, and presents the three tools for you
+to enable.
 
 ## 6. Using it from the iOS app
 
@@ -187,19 +221,24 @@ Once connected, ask Claude things like:
 
 > What's in my brain about the Postgres upgrade plan?
 
-The iOS app will call `search_brain` with your query, get back the
-curated top-N chunks from your vault, and reason over those. The vault
-itself never leaves your LAN — only the curated chunks do.
+Claude will call `search_brain` with your query, get back the curated
+top-N chunks from your vault, and reason over those. The vault itself
+never leaves your LAN — only the curated chunks do.
 
 ## Security posture
 
-- **Authentication.** Bearer token (256-bit random via `openssl rand -hex 32`
-  recommended). If you run Cloudflare Access on top, the endpoint also
-  requires a successful OAuth login — that's belt-and-suspenders.
+- **Authentication.** Pre-shared `client_id` + `client_secret` exchanged
+  for short-lived Bearer access tokens via OAuth 2.0 client_credentials.
+  256-bit random values (`openssl rand -hex 32`) are effectively
+  unbrute-forceable. Tokens live in memory and expire after
+  `BRAIN_MCP_OAUTH_TOKEN_TTL_SECONDS` (default 3600). Restart invalidates
+  all outstanding tokens; clients silently re-issue.
 - **Transport.** TLS terminates at the reverse proxy; the server itself
   only accepts loopback traffic.
 - **Scope.** The server exposes the same tools as stdio — read-only
   retrieval against your vault. No write endpoints.
-- **Rotation.** To rotate, generate a new `BRAIN_MCP_REMOTE_BEARER_TOKEN`,
-  restart with `launchctl kickstart -k gui/$(id -u)/com.gobag.mcp-remote`,
-  then update the token in the Claude iOS connector settings.
+- **Rotation.** To rotate, generate new `BRAIN_MCP_OAUTH_CLIENT_ID` and
+  `BRAIN_MCP_OAUTH_CLIENT_SECRET` values in `.env`, restart with
+  `launchctl kickstart -k gui/$(id -u)/com.gobag.mcp-remote`, then update
+  the credentials in claude.ai's connector settings. All issued access
+  tokens are invalidated on restart.
